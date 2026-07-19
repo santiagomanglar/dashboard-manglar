@@ -170,16 +170,29 @@ def tarjeta(titulo, valor, nota=""):
     )
 
 
-def estilo(fig, alto=320, titulo=""):
+def estilo(fig, alto=320, titulo="", leyenda="arriba"):
+    if leyenda == "abajo":
+        pos = dict(orientation="h", yanchor="top", y=-0.05, x=0.5, xanchor="center",
+                   font=dict(size=11, color=TINTA), bgcolor="rgba(0,0,0,0)")
+        margen = dict(l=10, r=40, t=52, b=60)
+    elif leyenda == "no":
+        pos = None
+        margen = dict(l=10, r=40, t=52, b=10)
+    else:
+        pos = dict(orientation="h", yanchor="bottom", y=1.0, x=0,
+                   font=dict(size=11, color=TINTA), bgcolor="rgba(0,0,0,0)")
+        margen = dict(l=10, r=40, t=52, b=10)
+
     fig.update_layout(
         height=alto,
-        title=dict(text=titulo, font=dict(size=14, color=TINTA), x=0, xanchor="left"),
-        margin=dict(l=10, r=40, t=52, b=10),
+        title=dict(text=titulo, font=dict(size=14, color=TINTA), x=0, xanchor="left",
+                   y=0.97, yanchor="top"),
+        margin=margen,
         plot_bgcolor="white",
         paper_bgcolor="white",
         font=dict(family="ui-sans-serif, system-ui, sans-serif", size=12, color=TINTA),
-        legend=dict(orientation="h", yanchor="bottom", y=1.0, x=0,
-                    font=dict(size=11, color=TINTA), bgcolor="rgba(0,0,0,0)"),
+        showlegend=pos is not None,
+        legend=pos or {},
         hoverlabel=dict(bgcolor="white", font_size=12, bordercolor=GRIS_SUAVE),
     )
     fig.update_xaxes(showgrid=False, linecolor=GRIS_SUAVE,
@@ -192,10 +205,6 @@ def estilo(fig, alto=320, titulo=""):
 # ─────────────────────────── Encabezado ───────────────────────────
 
 st.markdown('<div class="titulo">Dashboard Manglar — 2026</div>', unsafe_allow_html=True)
-st.markdown(
-    '<div class="subtitulo">Agencia BTL, material POP y merchandising · Resumen financiero</div>',
-    unsafe_allow_html=True,
-)
 
 origen = ARCHIVO_MODELO if os.path.exists(ARCHIVO_MODELO) else None
 if origen is None:
@@ -207,23 +216,16 @@ if origen is None:
 mov_raw, data_raw, cxp_raw, cxc_raw = leer_hojas(origen)
 df = preparar(mov_raw, data_raw)
 
-# ─────────────────────────── Filtros ───────────────────────────
+# ─────────────────────────── Filtro de mes ───────────────────────────
 
 meses_disp = sorted(int(m) for m in df["mes_caja"].dropna().unique())
 clientes_disp = sorted(c for c in df["cliente"].unique() if c != "Sin asignar")
 
-c1, c2 = st.columns(2)
-with c1:
-    sel_meses = st.multiselect("Mes", meses_disp, default=meses_disp,
-                               format_func=lambda m: MESES.get(m, str(m)))
-with c2:
-    sel_clientes = st.multiselect("Cliente", clientes_disp, default=clientes_disp)
-
+sel_meses = st.multiselect("Mes", meses_disp, default=meses_disp,
+                           format_func=lambda m: MESES.get(m, str(m)))
 sel_meses = sel_meses or meses_disp
-sel_clientes = sel_clientes or clientes_disp
 
 f_pyg = df[df["mes_causacion"].isin(sel_meses)]
-f_cli = f_pyg[f_pyg["cliente"].isin(sel_clientes)]
 
 # ─────────────────────────── Indicadores ───────────────────────────
 
@@ -268,9 +270,10 @@ with g1:
     for nombre, color in [("Ingresos", VERDE), ("Costo de ventas", ROJO), ("Gastos", ARENA)]:
         sub = (pyg[pyg["grupo"].eq(nombre)]
                .set_index("mes_causacion").reindex(orden)["valor_neto"].abs().fillna(0))
-        fig.add_bar(x=etiquetas, y=sub.values, name=nombre, marker_color=color)
+        fig.add_bar(x=etiquetas, y=sub.values, name=nombre, marker_color=color,
+                    hovertemplate="%{x} · %{y:$,.0f}<extra>" + nombre + "</extra>")
     fig.update_layout(barmode="group")
-    fig.update_yaxes(tickformat="$,.0s")
+    fig.update_yaxes(tickformat="$~s")
     st.plotly_chart(estilo(fig, 340, "Ingresos, costos y gastos por mes"),
                     use_container_width=True)
 
@@ -286,8 +289,9 @@ with g2:
         textfont=dict(size=10, color=GRIS),
         line=dict(color=AZUL, width=2.5), marker=dict(size=7),
         fill="tozeroy", fillcolor="rgba(65,96,127,0.07)",
+        hovertemplate="%{x} · %{y:$,.0f}<extra></extra>",
     )
-    fig.update_yaxes(tickformat="$,.0s")
+    fig.update_yaxes(tickformat="$~s")
     st.plotly_chart(estilo(fig, 340, "Evolución del saldo en caja"),
                     use_container_width=True)
 
@@ -295,6 +299,10 @@ with g2:
 
 st.markdown('<div class="seccion">Rentabilidad por cliente y proyecto</div>',
             unsafe_allow_html=True)
+
+sel_clientes = st.multiselect("Cliente", clientes_disp, default=clientes_disp)
+sel_clientes = sel_clientes or clientes_disp
+f_cli = f_pyg[f_pyg["cliente"].isin(sel_clientes)]
 
 rent = (
     f_cli.assign(
@@ -319,12 +327,14 @@ with r1:
     fig = go.Figure()
     fig.add_bar(y=pc.index, x=pc["ingreso"], name="Ingresos", orientation="h",
                 marker_color=AZUL, text=[money(v, True) for v in pc["ingreso"]],
-                textposition="outside", textfont=dict(size=10))
+                textposition="outside", textfont=dict(size=10),
+                hovertemplate="%{y} · %{x:$,.0f}<extra></extra>")
     fig.add_bar(y=pc.index, x=pc["neto"], name="Neto", orientation="h",
                 marker_color=VERDE, text=[money(v, True) for v in pc["neto"]],
-                textposition="outside", textfont=dict(size=10))
+                textposition="outside", textfont=dict(size=10),
+                hovertemplate="%{y} · %{x:$,.0f}<extra></extra>")
     fig.update_layout(barmode="group")
-    fig.update_xaxes(tickformat="$,.0s")
+    fig.update_xaxes(tickformat="$~s")
     st.plotly_chart(estilo(fig, 360, "Ingresos y neto por cliente"),
                     use_container_width=True)
 
@@ -336,7 +346,7 @@ with r2:
         marker=dict(colors=[AZUL, VERDE, ARENA, ROJO, "#8fa8bd", GRIS]),
         textinfo="percent", textfont=dict(size=11, color="white"),
     ))
-    st.plotly_chart(estilo(fig, 360, "Concentración de ingresos"),
+    st.plotly_chart(estilo(fig, 380, "Concentración de ingresos", "abajo"),
                     use_container_width=True)
 
 tabla = rent[["cliente", "proyecto", "ingreso", "costo", "neto", "margen"]].copy()
@@ -378,8 +388,9 @@ if not cxc_raw.empty and "Cliente" in cxc_raw.columns:
                 y=pend[col_cli].astype(str), x=pend[col_pend], orientation="h",
                 marker_color=ARENA, text=[money(v, True) for v in pend[col_pend]],
                 textposition="outside", textfont=dict(size=10),
+                hovertemplate="%{y} · %{x:$,.0f}<extra></extra>",
             ))
-            fig.update_xaxes(tickformat="$,.0s")
+            fig.update_xaxes(tickformat="$~s")
             st.plotly_chart(estilo(fig, 300, "Cartera pendiente por cliente"),
                             use_container_width=True)
     with cc2:
@@ -389,8 +400,9 @@ if not cxc_raw.empty and "Cliente" in cxc_raw.columns:
                 fig = go.Figure(go.Bar(x=ant.index.astype(str), y=ant.values,
                                        marker_color=ROJO,
                                        text=[money(v, True) for v in ant.values],
-                                       textposition="outside", textfont=dict(size=10)))
-                fig.update_yaxes(tickformat="$,.0s")
+                                       textposition="outside", textfont=dict(size=10),
+                hovertemplate="%{y} · %{x:$,.0f}<extra></extra>"))
+                fig.update_yaxes(tickformat="$~s")
                 st.plotly_chart(estilo(fig, 300, "Cartera por antigüedad (días)"),
                                 use_container_width=True)
 
@@ -438,8 +450,9 @@ if not cxp_raw.empty and "Proveedor" in cxp_raw.columns:
                 y=por_prov.index.astype(str), x=por_prov.values, orientation="h",
                 marker_color=ROJO, text=[money(v, True) for v in por_prov.values],
                 textposition="outside", textfont=dict(size=10),
+                hovertemplate="%{y} · %{x:$,.0f}<extra></extra>",
             ))
-            fig.update_xaxes(tickformat="$,.0s")
+            fig.update_xaxes(tickformat="$~s")
             st.plotly_chart(estilo(fig, 300, "Pendiente por proveedor"),
                             use_container_width=True)
     with pp2:
@@ -447,7 +460,8 @@ if not cxp_raw.empty and "Proveedor" in cxp_raw.columns:
         fig = go.Figure(go.Pie(labels=resumen.index, values=resumen.values, hole=0.6,
                                marker=dict(colors=[VERDE, ROJO]), sort=False,
                                textinfo="percent", textfont=dict(size=11, color="white")))
-        st.plotly_chart(estilo(fig, 300, "Estado de pagos"), use_container_width=True)
+        st.plotly_chart(estilo(fig, 320, "Estado de pagos", "abajo"),
+                        use_container_width=True)
 
     cols_cxp = [c for c in ["Fecha Recepción", "Fecha Pago", "Estado", "Proveedor",
                             "Cliente", "Proyecto", "Concepto/Rubro", col_tot]
@@ -466,8 +480,9 @@ gasto = (f_pyg[f_pyg["valor_neto"] < 0].groupby("cuenta")["valor_neto"]
          .sum().abs().sort_values())
 fig = go.Figure(go.Bar(y=gasto.index, x=gasto.values, orientation="h", marker_color=GRIS,
                        text=[money(v, True) for v in gasto.values],
-                       textposition="outside", textfont=dict(size=10)))
-fig.update_xaxes(tickformat="$,.0s")
+                       textposition="outside", textfont=dict(size=10),
+                hovertemplate="%{y} · %{x:$,.0f}<extra></extra>"))
+fig.update_xaxes(tickformat="$~s")
 st.plotly_chart(estilo(fig, 280, "Salidas por cuenta"), use_container_width=True)
 
 sin_clasificar = df.loc[df["cuenta"].eq("Revisar"), "valor"].sum()
@@ -477,4 +492,3 @@ if abs(sin_clasificar) > 0:
         "No entran al resultado hasta asignarles categoría."
     )
 
-st.caption("Fuente: modelo financiero de Manglar. Uso interno.")
