@@ -43,6 +43,9 @@ ROJO = "#a4553f"
 AZUL = "#41607f"
 ARENA = "#c9a227"
 
+# Sin barra de herramientas y con ajuste automático al ancho de pantalla
+PLOTLY_CONF = {"displayModeBar": False, "responsive": True}
+
 # ─────────────────────────── Estilos ───────────────────────────
 
 st.markdown(
@@ -83,6 +86,30 @@ st.markdown(
 
       div[data-testid="stDataFrame"] {border: 1px solid #e5e7eb; border-radius: 10px;}
       label {color: #6b7280 !important; font-size: .8rem !important;}
+
+      /* ── Pantallas pequeñas (celular) ── */
+      @media (max-width: 640px) {
+        .block-container {padding-left: .75rem !important; padding-right: .75rem !important;
+                          padding-top: 1.2rem !important;}
+        .titulo {font-size: 1.32rem;}
+        .seccion {font-size: 1rem; margin: 1.5rem 0 .6rem 0;}
+        .tarjeta {padding: .8rem .9rem;}
+        .tarjeta-titulo {font-size: .66rem; letter-spacing: .05em;}
+        .kpi-valor {font-size: 1.28rem;}
+        .kpi-nota {font-size: .7rem;}
+
+        /* Los indicadores se acomodan de a dos por fila */
+        [data-testid="stHorizontalBlock"] {flex-wrap: wrap !important; gap: .55rem !important;}
+        [data-testid="stHorizontalBlock"] > div[data-testid="column"] {
+          flex: 1 1 calc(50% - .55rem) !important;
+          min-width: calc(50% - .55rem) !important;
+        }
+        /* Las gráficas y tablas ocupan el ancho completo */
+        [data-testid="stHorizontalBlock"] > div[data-testid="column"]:has(.js-plotly-plot),
+        [data-testid="stHorizontalBlock"] > div[data-testid="column"]:has([data-testid="stDataFrame"]) {
+          flex: 1 1 100% !important; min-width: 100% !important;
+        }
+      }
     </style>
     """,
     unsafe_allow_html=True,
@@ -275,7 +302,7 @@ with g1:
     fig.update_layout(barmode="group")
     fig.update_yaxes(tickformat="$~s")
     st.plotly_chart(estilo(fig, 340, "Ingresos, costos y gastos por mes"),
-                    use_container_width=True)
+                    use_container_width=True, config=PLOTLY_CONF)
 
 with g2:
     serie = (df[df["mes_caja"].notna()].groupby("mes_caja")["valor"]
@@ -293,7 +320,7 @@ with g2:
     )
     fig.update_yaxes(tickformat="$~s")
     st.plotly_chart(estilo(fig, 340, "Evolución del saldo en caja"),
-                    use_container_width=True)
+                    use_container_width=True, config=PLOTLY_CONF)
 
 # ─────────────────────── Rentabilidad ───────────────────────
 
@@ -327,16 +354,16 @@ with r1:
     fig = go.Figure()
     fig.add_bar(y=pc.index, x=pc["ingreso"], name="Ingresos", orientation="h",
                 marker_color=AZUL, text=[money(v, True) for v in pc["ingreso"]],
-                textposition="outside", textfont=dict(size=10),
+                textposition="auto", textfont=dict(size=10), cliponaxis=False,
                 hovertemplate="%{y} · %{x:$,.0f}<extra></extra>")
     fig.add_bar(y=pc.index, x=pc["neto"], name="Neto", orientation="h",
                 marker_color=VERDE, text=[money(v, True) for v in pc["neto"]],
-                textposition="outside", textfont=dict(size=10),
+                textposition="auto", textfont=dict(size=10), cliponaxis=False,
                 hovertemplate="%{y} · %{x:$,.0f}<extra></extra>")
     fig.update_layout(barmode="group")
     fig.update_xaxes(tickformat="$~s")
     st.plotly_chart(estilo(fig, 360, "Ingresos y neto por cliente"),
-                    use_container_width=True)
+                    use_container_width=True, config=PLOTLY_CONF)
 
 with r2:
     conc = rent.groupby("cliente")["ingreso"].sum().sort_values(ascending=False)
@@ -347,7 +374,7 @@ with r2:
         textinfo="percent", textfont=dict(size=11, color="white"),
     ))
     st.plotly_chart(estilo(fig, 380, "Concentración de ingresos", "abajo"),
-                    use_container_width=True)
+                    use_container_width=True, config=PLOTLY_CONF)
 
 tabla = rent[["cliente", "proyecto", "ingreso", "costo", "neto", "margen"]].copy()
 tabla.columns = ["Cliente", "Proyecto", "Ingresos", "Costos", "Neto", "Margen %"]
@@ -372,6 +399,24 @@ if not cxc_raw.empty and "Cliente" in cxc_raw.columns:
     for c in (col_fact, col_cob, col_pend):
         cxc[c] = pd.to_numeric(cxc[c], errors="coerce").fillna(0)
 
+    fc1, fc2 = st.columns(2)
+    with fc1:
+        op_cli = sorted(cxc[col_cli].astype(str).unique())
+        sel_cxc_cli = st.multiselect("Cliente", op_cli, default=op_cli, key="cxc_cli")
+    with fc2:
+        if "Estado" in cxc.columns:
+            op_est = sorted(cxc["Estado"].astype(str).unique())
+            sel_cxc_est = st.multiselect("Estado", op_est, default=op_est, key="cxc_est")
+        else:
+            sel_cxc_est = None
+
+    if sel_cxc_cli:
+        cxc = cxc[cxc[col_cli].astype(str).isin(sel_cxc_cli)]
+    if sel_cxc_est:
+        cxc = cxc[cxc["Estado"].astype(str).isin(sel_cxc_est)]
+    if cxc.empty:
+        st.info("No hay cuentas por cobrar con los filtros seleccionados.")
+
     kc = st.columns(3)
     kc[0].markdown(tarjeta("Facturado", money(cxc[col_fact].sum(), True), "Con IVA"),
                    unsafe_allow_html=True)
@@ -387,12 +432,12 @@ if not cxc_raw.empty and "Cliente" in cxc_raw.columns:
             fig = go.Figure(go.Bar(
                 y=pend[col_cli].astype(str), x=pend[col_pend], orientation="h",
                 marker_color=ARENA, text=[money(v, True) for v in pend[col_pend]],
-                textposition="outside", textfont=dict(size=10),
+                textposition="auto", textfont=dict(size=10), cliponaxis=False,
                 hovertemplate="%{y} · %{x:$,.0f}<extra></extra>",
             ))
             fig.update_xaxes(tickformat="$~s")
             st.plotly_chart(estilo(fig, 300, "Cartera pendiente por cliente"),
-                            use_container_width=True)
+                            use_container_width=True, config=PLOTLY_CONF)
     with cc2:
         if "Antigüedad" in cxc.columns:
             ant = cxc[cxc[col_pend] > 0].groupby("Antigüedad")[col_pend].sum()
@@ -400,11 +445,11 @@ if not cxc_raw.empty and "Cliente" in cxc_raw.columns:
                 fig = go.Figure(go.Bar(x=ant.index.astype(str), y=ant.values,
                                        marker_color=ROJO,
                                        text=[money(v, True) for v in ant.values],
-                                       textposition="outside", textfont=dict(size=10),
+                                       textposition="auto", textfont=dict(size=10), cliponaxis=False,
                 hovertemplate="%{y} · %{x:$,.0f}<extra></extra>"))
                 fig.update_yaxes(tickformat="$~s")
                 st.plotly_chart(estilo(fig, 300, "Cartera por antigüedad (días)"),
-                                use_container_width=True)
+                                use_container_width=True, config=PLOTLY_CONF)
 
     cols_cxc = [c for c in [col_cli, "Proyecto", col_fact, col_cob, col_pend,
                             "Fecha Vence", "Antigüedad", "Estado", "Notas"]
@@ -427,11 +472,34 @@ if not cxp_raw.empty and "Proveedor" in cxp_raw.columns:
 
     col_tot = "Valor Total" if "Valor Total" in cxp.columns else cxp.columns[10]
     cxp[col_tot] = pd.to_numeric(cxp[col_tot], errors="coerce").fillna(0)
-    estado = (cxp["Estado"].astype(str).str.strip().str.lower()
-              if "Estado" in cxp.columns else pd.Series("", index=cxp.index))
-    es_pagado = estado.eq("pagado")
-    pagado = cxp.loc[es_pagado, col_tot].sum()
-    pendiente = cxp.loc[~es_pagado, col_tot].sum()
+
+    fp1, fp2 = st.columns(2)
+    with fp1:
+        op_prov = sorted(cxp["Proveedor"].astype(str).unique())
+        sel_prov = st.multiselect("Proveedor", op_prov, default=op_prov, key="cxp_prov")
+    with fp2:
+        if "Estado" in cxp.columns:
+            op_est_p = sorted(cxp["Estado"].astype(str).unique())
+            sel_est_p = st.multiselect("Estado", op_est_p, default=op_est_p, key="cxp_est")
+        else:
+            sel_est_p = None
+
+    if sel_prov:
+        cxp = cxp[cxp["Proveedor"].astype(str).isin(sel_prov)]
+    if sel_est_p:
+        cxp = cxp[cxp["Estado"].astype(str).isin(sel_est_p)]
+
+    if cxp.empty:
+        st.info("No hay cuentas por pagar con los filtros seleccionados.")
+        estado = pd.Series(dtype=str)
+        es_pagado = pd.Series(dtype=bool)
+        pagado = pendiente = 0
+    else:
+        estado = (cxp["Estado"].astype(str).str.strip().str.lower()
+                  if "Estado" in cxp.columns else pd.Series("", index=cxp.index))
+        es_pagado = estado.eq("pagado")
+        pagado = cxp.loc[es_pagado, col_tot].sum()
+        pendiente = cxp.loc[~es_pagado, col_tot].sum()
 
     kp = st.columns(3)
     kp[0].markdown(tarjeta("Total facturado", money(cxp[col_tot].sum(), True),
@@ -449,19 +517,19 @@ if not cxp_raw.empty and "Proveedor" in cxp_raw.columns:
             fig = go.Figure(go.Bar(
                 y=por_prov.index.astype(str), x=por_prov.values, orientation="h",
                 marker_color=ROJO, text=[money(v, True) for v in por_prov.values],
-                textposition="outside", textfont=dict(size=10),
+                textposition="auto", textfont=dict(size=10), cliponaxis=False,
                 hovertemplate="%{y} · %{x:$,.0f}<extra></extra>",
             ))
             fig.update_xaxes(tickformat="$~s")
             st.plotly_chart(estilo(fig, 300, "Pendiente por proveedor"),
-                            use_container_width=True)
+                            use_container_width=True, config=PLOTLY_CONF)
     with pp2:
         resumen = pd.Series({"Pagado": pagado, "Pendiente": pendiente})
         fig = go.Figure(go.Pie(labels=resumen.index, values=resumen.values, hole=0.6,
                                marker=dict(colors=[VERDE, ROJO]), sort=False,
                                textinfo="percent", textfont=dict(size=11, color="white")))
         st.plotly_chart(estilo(fig, 320, "Estado de pagos", "abajo"),
-                        use_container_width=True)
+                        use_container_width=True, config=PLOTLY_CONF)
 
     cols_cxp = [c for c in ["Fecha Recepción", "Fecha Pago", "Estado", "Proveedor",
                             "Cliente", "Proyecto", "Concepto/Rubro", col_tot]
@@ -480,10 +548,10 @@ gasto = (f_pyg[f_pyg["valor_neto"] < 0].groupby("cuenta")["valor_neto"]
          .sum().abs().sort_values())
 fig = go.Figure(go.Bar(y=gasto.index, x=gasto.values, orientation="h", marker_color=GRIS,
                        text=[money(v, True) for v in gasto.values],
-                       textposition="outside", textfont=dict(size=10),
+                       textposition="auto", textfont=dict(size=10), cliponaxis=False,
                 hovertemplate="%{y} · %{x:$,.0f}<extra></extra>"))
 fig.update_xaxes(tickformat="$~s")
-st.plotly_chart(estilo(fig, 280, "Salidas por cuenta"), use_container_width=True)
+st.plotly_chart(estilo(fig, 280, "Salidas por cuenta"), use_container_width=True, config=PLOTLY_CONF)
 
 sin_clasificar = df.loc[df["cuenta"].eq("Revisar"), "valor"].sum()
 if abs(sin_clasificar) > 0:
