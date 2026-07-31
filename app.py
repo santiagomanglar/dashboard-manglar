@@ -90,6 +90,23 @@ st.markdown(
       div[data-testid="stDataFrame"] {border: 1px solid #e5e7eb; border-radius: 10px;}
       label {color: #6b7280 !important; font-size: .8rem !important;}
 
+      /* Botones de filtro: sobrios, sin llenar la pantalla */
+      div[data-testid="stButtonGroup"] button {
+        border: 1px solid #e5e7eb !important; background: #ffffff !important;
+        border-radius: 8px !important; font-size: .82rem !important;
+        color: #374151 !important; padding: .25rem .7rem !important;}
+      div[data-testid="stButtonGroup"] button[aria-checked="true"],
+      div[data-testid="stButtonGroup"] button[aria-pressed="true"] {
+        background: #41607f !important; border-color: #41607f !important;}
+      div[data-testid="stButtonGroup"] button[aria-checked="true"] *,
+      div[data-testid="stButtonGroup"] button[aria-pressed="true"] * {
+        color: #ffffff !important;}
+
+      div[data-testid="stPopover"] button {
+        border: 1px solid #e5e7eb !important; background: #ffffff !important;
+        border-radius: 8px !important; font-size: .82rem !important;
+        color: #374151 !important; justify-content: space-between !important;}
+
       @media (max-width: 640px) {
         .block-container {padding-left: .75rem !important; padding-right: .75rem !important;
                           padding-top: 1.2rem !important;}
@@ -212,6 +229,43 @@ def barras_horizontal(etiquetas, valores, color, titulo, alto=300):
     ))
     fig.update_xaxes(tickformat="$~s")
     return estilo(fig, alto, titulo, "no")
+
+
+AYUDA_FILTRO = "Si no selecciona ninguno, se muestran todos."
+
+
+def filtro(etiqueta, opciones, key, formato=None, umbral=8):
+    """Filtro compacto. Sin seleccion significa todos, para no llenar la
+    pantalla de etiquetas.
+
+    Listas cortas se muestran como botones. Listas largas se colapsan en un
+    boton que abre el buscador.
+    """
+    opciones = list(opciones)
+    formato = formato or (lambda x: str(x))
+
+    if not opciones:
+        return []
+
+    if len(opciones) <= umbral and hasattr(st, "pills"):
+        sel = st.pills(etiqueta, opciones, selection_mode="multi", key=key,
+                       format_func=formato, help=AYUDA_FILTRO)
+        return list(sel) if sel else opciones
+
+    actuales = st.session_state.get(key) or []
+    resumen = (f"{etiqueta}: {len(actuales)} de {len(opciones)}" if actuales
+               else f"{etiqueta}: todos ({len(opciones)})")
+
+    if hasattr(st, "popover"):
+        with st.popover(resumen, use_container_width=True):
+            sel = st.multiselect(etiqueta, opciones, key=key, format_func=formato,
+                                 placeholder="Escriba para buscar",
+                                 label_visibility="collapsed")
+    else:
+        sel = st.multiselect(etiqueta, opciones, key=key, format_func=formato,
+                             placeholder=f"Todos ({len(opciones)})",
+                             help=AYUDA_FILTRO)
+    return list(sel) if sel else opciones
 
 
 # ─────────────────────────── Carga ───────────────────────────
@@ -346,9 +400,8 @@ meses_mov = {int(m) for m in df["mes_caja"].dropna().unique()}
 meses_fac = {int(m) for m in cxc["Mes"].dropna().unique()} if not cxc.empty else set()
 meses_disp = sorted(meses_mov | meses_fac)
 
-sel_meses = st.multiselect("Mes", meses_disp, default=meses_disp,
-                           format_func=lambda m: MESES.get(m, str(m)))
-sel_meses = sel_meses or meses_disp
+sel_meses = filtro("Mes", meses_disp, "f_mes",
+                   formato=lambda m: MESES.get(m, str(m)), umbral=12)
 
 f_pyg = df[df["mes_causacion"].isin(sel_meses)]
 cxc_mes = cxc[cxc["Mes"].isin(sel_meses)] if not cxc.empty else cxc
@@ -434,8 +487,14 @@ st.markdown('<div class="seccion">Rentabilidad por cliente y proyecto</div>',
 
 fr1, fr2 = st.columns([1, 2])
 with fr1:
-    enfoque = st.radio("Base de cálculo", ["Facturas", "Movimientos"],
-                       horizontal=True, key="enfoque")
+    opciones_base = ["Facturas", "Movimientos"]
+    if hasattr(st, "segmented_control"):
+        enfoque = st.segmented_control("Base de cálculo", opciones_base,
+                                       default="Facturas", key="enfoque")
+        enfoque = enfoque or "Facturas"
+    else:
+        enfoque = st.radio("Base de cálculo", opciones_base, horizontal=True,
+                           key="enfoque")
 
 
 def rentabilidad_facturas():
@@ -479,8 +538,7 @@ rent["margen"] = np.where(rent["ingresos"] > 0,
 clientes_disp = sorted(c for c in rent["cliente"].unique()
                        if str(c).lower() not in SIN_ASIGNAR)
 with fr2:
-    sel_clientes = st.multiselect("Cliente", clientes_disp, default=clientes_disp)
-sel_clientes = sel_clientes or clientes_disp
+    sel_clientes = filtro("Cliente", clientes_disp, "f_rent_cli")
 rent = rent[rent["cliente"].isin(sel_clientes)]
 
 r1, r2 = st.columns([1.25, 1])
@@ -541,13 +599,12 @@ if not cxc.empty:
     fc1, fc2 = st.columns(2)
     with fc1:
         op_cli = sorted(cxc["Cliente"].unique())
-        sel_cxc_cli = st.multiselect("Cliente", op_cli, default=op_cli, key="cxc_cli")
+        sel_cxc_cli = filtro("Cliente", op_cli, "f_cxc_cli")
     with fc2:
         op_est = sorted(cxc["Estado"].unique())
-        sel_cxc_est = st.multiselect("Estado", op_est, default=op_est, key="cxc_est")
+        sel_cxc_est = filtro("Estado", op_est, "f_cxc_est")
 
-    v = cxc[cxc["Cliente"].isin(sel_cxc_cli or op_cli)
-            & cxc["Estado"].isin(sel_cxc_est or op_est)]
+    v = cxc[cxc["Cliente"].isin(sel_cxc_cli) & cxc["Estado"].isin(sel_cxc_est)]
 
     if v.empty:
         st.info("No hay facturas con los filtros seleccionados.")
@@ -611,13 +668,12 @@ if not cxp.empty:
     fp1, fp2 = st.columns(2)
     with fp1:
         op_prov = sorted(cxp["Proveedor"].unique())
-        sel_prov = st.multiselect("Proveedor", op_prov, default=op_prov, key="cxp_prov")
+        sel_prov = filtro("Proveedor", op_prov, "f_cxp_prov")
     with fp2:
         op_est_p = sorted(cxp["Estado"].unique())
-        sel_est_p = st.multiselect("Estado", op_est_p, default=op_est_p, key="cxp_est")
+        sel_est_p = filtro("Estado", op_est_p, "f_cxp_est")
 
-    p = cxp[cxp["Proveedor"].isin(sel_prov or op_prov)
-            & cxp["Estado"].isin(sel_est_p or op_est_p)]
+    p = cxp[cxp["Proveedor"].isin(sel_prov) & cxp["Estado"].isin(sel_est_p)]
 
     if p.empty:
         st.info("No hay documentos con los filtros seleccionados.")
