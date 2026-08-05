@@ -272,18 +272,20 @@ def filtro(etiqueta, opciones, key, formato=None, umbral=8):
 
 # ─────────────────────────── Carga ───────────────────────────
 
-def leer_tabla(origen, hoja, columna_clave, fila_por_defecto):
+def leer_tabla(origen, hoja, claves, fila_por_defecto):
     """Lee una tabla buscando sola la fila de encabezado.
 
-    Si se agregan o quitan filas arriba de la tabla, el tablero sigue leyendo
-    bien porque ubica el encabezado por el nombre de la columna clave.
+    `claves` son los nombres posibles de la columna que identifica cada fila.
+    Se aceptan varios para que un cambio de nombre en el modelo no rompa nada.
     """
+    if isinstance(claves, str):
+        claves = [claves]
     try:
         crudo = pd.read_excel(origen, sheet_name=hoja, header=None, nrows=30)
         fila = fila_por_defecto
         for i in range(len(crudo)):
             valores = [str(v).strip() for v in crudo.iloc[i].tolist()]
-            if columna_clave in valores:
+            if any(k in valores for k in claves):
                 fila = i
                 break
         if hasattr(origen, "seek"):
@@ -291,6 +293,14 @@ def leer_tabla(origen, hoja, columna_clave, fila_por_defecto):
         return pd.read_excel(origen, sheet_name=hoja, header=fila)
     except Exception:
         return pd.DataFrame()
+
+
+def columna_presente(df, opciones):
+    """Devuelve el primer nombre de columna que exista en el marco."""
+    for o in opciones:
+        if o in df.columns:
+            return o
+    return None
 
 
 @st.cache_data(show_spinner=False)
@@ -301,8 +311,8 @@ def leer_hojas(origen):
     data = pd.read_excel(origen, sheet_name=HOJA_DATA)
     if hasattr(origen, "seek"):
         origen.seek(0)
-    cxp = leer_tabla(origen, HOJA_CXP, "Numero", CABECERA_CXP)
-    cxc = leer_tabla(origen, HOJA_CXC, "Folio", CABECERA_CXC)
+    cxp = leer_tabla(origen, HOJA_CXP, ["Factura", "Numero"], CABECERA_CXP)
+    cxc = leer_tabla(origen, HOJA_CXC, ["Folio"], CABECERA_CXC)
     if hasattr(origen, "seek"):
         origen.seek(0)
     proy = leer_cruda(origen, HOJA_PROY)
@@ -406,16 +416,28 @@ def preparar_cxc(bruto):
 
 def preparar_cxp(bruto):
     if bruto.empty:
-        return pd.DataFrame()
-    df = cortar_en_total(bruto, "Numero")
+        return pd.DataFrame(), 0.0, 0
+    clave = columna_presente(bruto, ["Factura", "Numero"])
+    if clave is None:
+        return pd.DataFrame(), 0.0, 0
+    df = cortar_en_total(bruto, clave)
     if df.empty:
-        return df
+        return df, 0.0, 0
     df = numerico(df, ["Valor Producto", "IVA", "Valor Total", "Pagado", "Saldo"])
-    for c in ("Proveedor", "Cliente", "Proyecto", "Estado"):
+    for c in ("Proveedor", "Cliente", "Proyecto", "Estado", "Alerta", "Dashboard"):
         if c in df.columns:
             df[c] = texto(df[c])
     df["asignado"] = esta_asignado(df["Cliente"]) & esta_asignado(df["Proyecto"])
-    return df
+
+    # La columna Dashboard del modelo decide que facturas se muestran.
+    # Las marcadas No siguen en el CxP, solo no aparecen aqui.
+    excluido, n_excluidas = 0.0, 0
+    if "Dashboard" in df.columns:
+        fuera = df["Dashboard"].str.strip().str.lower().eq("no")
+        excluido = float(df.loc[fuera, "Valor Total"].sum())
+        n_excluidas = int(fuera.sum())
+        df = df[~fuera].copy()
+    return df, excluido, n_excluidas
 
 
 # ─────────────────────────── Encabezado ───────────────────────────
@@ -432,7 +454,7 @@ if origen is None:
 mov_raw, data_raw, cxp_raw, cxc_raw, proy_raw, iva_raw = leer_hojas(origen)
 df = preparar_movimientos(mov_raw, data_raw)
 cxc = preparar_cxc(cxc_raw)
-cxp = preparar_cxp(cxp_raw)
+cxp, cxp_excluido, cxp_n_excl = preparar_cxp(cxp_raw)
 
 # ─────────────────────────── Filtro de mes ───────────────────────────
 
@@ -769,7 +791,13 @@ if not cxp.empty:
                     "Aparecen en la primera semana de la proyección de caja."
                 )
 
-        cols = [c for c in ["Fecha Recepción", "Numero", "Proveedor", "Cliente",
+        if cxp_n_excl:
+            st.caption(
+                f"No se muestran {cxp_n_excl} documentos marcados como No en el modelo "
+                f"({money(cxp_excluido)}). Siguen contando en el CxP."
+            )
+
+        cols = [c for c in ["Fecha Recepción", "Factura", "Numero", "Proveedor", "Cliente",
                             "Proyecto", "Valor Total", "Pagado", "Saldo",
                             "Vence", "Días", "Alerta"] if c in p.columns]
         vista = p[cols].copy()
