@@ -28,6 +28,8 @@ HOJA_MOV = "Extractos bancarios - Manglar"
 HOJA_DATA = "Data"
 HOJA_CXP = "CxP"
 HOJA_CXC = "CxC"
+HOJA_PROY = "Proyeccion Flujo de Caja"
+HOJA_IVA = "Planeacion IVA"
 
 # Fila donde arranca el encabezado de cada tabla (base 0, como lo espera pandas)
 CABECERA_CXC = 9    # fila 10 de la hoja
@@ -301,7 +303,45 @@ def leer_hojas(origen):
         origen.seek(0)
     cxp = leer_tabla(origen, HOJA_CXP, "Numero", CABECERA_CXP)
     cxc = leer_tabla(origen, HOJA_CXC, "Folio", CABECERA_CXC)
-    return mov, data, cxp, cxc
+    if hasattr(origen, "seek"):
+        origen.seek(0)
+    proy = leer_cruda(origen, HOJA_PROY)
+    if hasattr(origen, "seek"):
+        origen.seek(0)
+    iva = leer_cruda(origen, HOJA_IVA)
+    return mov, data, cxp, cxc, proy, iva
+
+
+def leer_cruda(origen, hoja):
+    """Lee una hoja sin encabezado, para ubicar las filas por su etiqueta."""
+    try:
+        return pd.read_excel(origen, sheet_name=hoja, header=None)
+    except Exception:
+        return pd.DataFrame()
+
+
+def fila_por_etiqueta(df, etiqueta, columna=1):
+    """Devuelve el indice de la fila cuya etiqueta coincide.
+
+    Se busca por texto y no por posicion, para que el tablero siga funcionando
+    aunque se agreguen o quiten filas en el modelo.
+    """
+    if df.empty or columna >= df.shape[1]:
+        return None
+    col = df[columna].astype(str).str.strip().str.lower()
+    coincide = col.eq(etiqueta.strip().lower())
+    return int(coincide.idxmax()) if coincide.any() else None
+
+
+def valores_fila(df, fila, desde=2, hasta=15):
+    if fila is None:
+        return []
+    hasta = min(hasta, df.shape[1])
+    vals = []
+    for c in range(desde, hasta):
+        v = df.iat[fila, c]
+        vals.append(v if isinstance(v, (int, float)) and not pd.isna(v) else 0.0)
+    return vals
 
 
 def preparar_movimientos(mov, data):
@@ -389,7 +429,7 @@ if origen is None:
         st.stop()
     origen = io.BytesIO(subido.getvalue())
 
-mov_raw, data_raw, cxp_raw, cxc_raw = leer_hojas(origen)
+mov_raw, data_raw, cxp_raw, cxc_raw, proy_raw, iva_raw = leer_hojas(origen)
 df = preparar_movimientos(mov_raw, data_raw)
 cxc = preparar_cxc(cxc_raw)
 cxp = preparar_cxp(cxp_raw)
@@ -670,10 +710,12 @@ if not cxp.empty:
         op_prov = sorted(cxp["Proveedor"].unique())
         sel_prov = filtro("Proveedor", op_prov, "f_cxp_prov")
     with fp2:
-        op_est_p = sorted(cxp["Estado"].unique())
-        sel_est_p = filtro("Estado", op_est_p, "f_cxp_est")
+        col_alerta = "Alerta" if "Alerta" in cxp.columns else "Estado"
+        op_est_p = sorted(cxp[col_alerta].astype(str).unique())
+        sel_est_p = filtro(col_alerta, op_est_p, "f_cxp_est")
 
-    p = cxp[cxp["Proveedor"].isin(sel_prov) & cxp["Estado"].isin(sel_est_p)]
+    p = cxp[cxp["Proveedor"].isin(sel_prov)
+            & cxp[col_alerta].astype(str).isin(sel_est_p)]
 
     if p.empty:
         st.info("No hay documentos con los filtros seleccionados.")
@@ -700,29 +742,170 @@ if not cxp.empty:
             else:
                 st.info("No hay saldos pendientes con estos filtros.")
         with pp2:
-            resumen = pd.Series({"Pagado": p["Pagado"].sum(),
-                                 "Pendiente": p["Saldo"].sum()})
-            resumen = resumen[resumen > 0]
-            if not resumen.empty:
-                fig = go.Figure(go.Pie(
-                    labels=resumen.index, values=resumen.values, hole=0.6,
-                    marker=dict(colors=[VERDE, ROJO]), sort=False,
-                    textinfo="percent", textfont=dict(size=11, color="white")))
-                st.plotly_chart(estilo(fig, 320, "Estado de pagos", "abajo"),
-                                use_container_width=True, config=PLOTLY_CONF)
+            if "Alerta" in p.columns:
+                orden_al = ["Vencida", "Por vencer", "Vigente", "Sin fecha"]
+                al = (p[p["Saldo"] > 0].groupby("Alerta")["Saldo"].sum())
+                al = al.reindex([o for o in orden_al if o in al.index]).dropna()
+                if not al.empty:
+                    colores = {"Vencida": ROJO, "Por vencer": ARENA,
+                               "Vigente": VERDE, "Sin fecha": GRIS}
+                    fig = go.Figure(go.Bar(
+                        x=al.index.astype(str), y=al.values,
+                        marker_color=[colores.get(i, GRIS) for i in al.index],
+                        text=[money(v, True) for v in al.values],
+                        textposition="auto", textfont=dict(size=10), cliponaxis=False,
+                        hovertemplate="%{x} · %{y:$,.0f}<extra></extra>"))
+                    fig.update_yaxes(tickformat="$~s")
+                    st.plotly_chart(estilo(fig, 320, "Saldo por estado de vencimiento", "no"),
+                                    use_container_width=True, config=PLOTLY_CONF)
+
+        # Aviso de lo vencido: es el dato que hay que mirar primero
+        if "Alerta" in p.columns:
+            vencido = p.loc[p["Alerta"].eq("Vencida"), "Saldo"].sum()
+            n_venc = int((p["Alerta"].eq("Vencida") & (p["Saldo"] > 0)).sum())
+            if vencido > 0:
+                st.warning(
+                    f"Hay {money(vencido)} vencidos en {n_venc} facturas. "
+                    "Aparecen en la primera semana de la proyección de caja."
+                )
 
         cols = [c for c in ["Fecha Recepción", "Numero", "Proveedor", "Cliente",
-                            "Proyecto", "Valor Producto", "IVA", "Valor Total",
-                            "Pagado", "Saldo", "Estado"] if c in p.columns]
+                            "Proyecto", "Valor Total", "Pagado", "Saldo",
+                            "Vence", "Días", "Alerta"] if c in p.columns]
         vista = p[cols].copy()
-        if "Fecha Recepción" in vista.columns:
-            vista["Fecha Recepción"] = pd.to_datetime(
-                vista["Fecha Recepción"], errors="coerce").dt.strftime("%d/%m/%Y")
+        for c in ("Fecha Recepción", "Vence"):
+            if c in vista.columns:
+                vista[c] = pd.to_datetime(vista[c], errors="coerce").dt.strftime("%d/%m/%Y")
         st.dataframe(
-            vista.style.format({"Valor Producto": "${:,.0f}", "IVA": "${:,.0f}",
-                                "Valor Total": "${:,.0f}", "Pagado": "${:,.0f}",
-                                "Saldo": "${:,.0f}"}),
+            vista.style.format({"Valor Total": "${:,.0f}", "Pagado": "${:,.0f}",
+                                "Saldo": "${:,.0f}", "Días": "{:.0f}"}),
             use_container_width=True, hide_index=True)
+
+# ─────────────────────── Proyección de caja ───────────────────────
+
+if not proy_raw.empty:
+    fila_desde = fila_por_etiqueta(proy_raw, "Desde")
+    fila_saldo = fila_por_etiqueta(proy_raw, "Saldo final")
+    if fila_desde is not None and fila_saldo is not None:
+        st.markdown('<div class="seccion">Proyección de caja — 13 semanas</div>',
+                    unsafe_allow_html=True)
+
+        fechas = []
+        for c in range(2, min(16, proy_raw.shape[1])):
+            v = proy_raw.iat[fila_desde, c]
+            fechas.append(pd.to_datetime(v, errors="coerce"))
+        etiquetas_sem = [d.strftime("%d/%m") if pd.notna(d) else "" for d in fechas]
+
+        saldos = valores_fila(proy_raw, fila_saldo)
+        cobros = valores_fila(proy_raw, fila_por_etiqueta(proy_raw, "Cobros de cartera (CxC)"))
+        f_pagos = fila_por_etiqueta(proy_raw, "Pagos a proveedores (por vencimiento)")
+        if f_pagos is None:
+            f_pagos = fila_por_etiqueta(proy_raw, "Pagos a proveedores (CxP)")
+        pagos = valores_fila(proy_raw, f_pagos)
+        egresos = valores_fila(proy_raw, fila_por_etiqueta(proy_raw, "Total egresos"))
+
+        n = min(len(etiquetas_sem), len(saldos))
+        etiquetas_sem, saldos = etiquetas_sem[:n], saldos[:n]
+        cobros = (cobros + [0] * n)[:n]
+        pagos = (pagos + [0] * n)[:n]
+        egresos = (egresos + [0] * n)[:n]
+
+        minimo = min(saldos) if saldos else 0
+        semana_min = etiquetas_sem[saldos.index(minimo)] if saldos else "—"
+        kp2 = st.columns(4)
+        kp2[0].markdown(tarjeta("Saldo hoy", money(saldo_caja, True),
+                                "Según el extracto"), unsafe_allow_html=True)
+        kp2[1].markdown(tarjeta("Cobros proyectados", money(sum(cobros), True),
+                                "13 semanas"), unsafe_allow_html=True)
+        kp2[2].markdown(tarjeta("Egresos proyectados", money(sum(egresos), True),
+                                "13 semanas"), unsafe_allow_html=True)
+        kp2[3].markdown(tarjeta("Saldo más bajo", money(minimo, True),
+                                f"Semana del {semana_min}"), unsafe_allow_html=True)
+
+        fig = go.Figure()
+        fig.add_bar(x=etiquetas_sem, y=cobros, name="Cobros", marker_color=VERDE,
+                    hovertemplate="%{x} · %{y:$,.0f}<extra>Cobros</extra>")
+        fig.add_bar(x=etiquetas_sem, y=[abs(v) for v in pagos], name="Pagos a proveedores",
+                    marker_color=ROJO,
+                    hovertemplate="%{x} · %{y:$,.0f}<extra>Pagos</extra>")
+        fig.add_scatter(x=etiquetas_sem, y=saldos, name="Saldo proyectado",
+                        mode="lines+markers", line=dict(color=AZUL, width=2.5),
+                        marker=dict(size=6), yaxis="y",
+                        hovertemplate="%{x} · %{y:$,.0f}<extra>Saldo</extra>")
+        fig.update_layout(barmode="group")
+        fig.update_yaxes(tickformat="$~s")
+        st.plotly_chart(estilo(fig, 360, "Cobros, pagos y saldo semana a semana"),
+                        use_container_width=True, config=PLOTLY_CONF)
+
+        if minimo < 0:
+            st.warning(
+                f"La proyección queda en negativo la semana del {semana_min} "
+                f"({money(minimo)}). Conviene revisar el calendario de pagos."
+            )
+
+# ─────────────────────── IVA ───────────────────────
+
+if not iva_raw.empty:
+    fila_bim1 = fila_por_etiqueta(iva_raw, "Bim 1")
+    if fila_bim1 is not None:
+        st.markdown('<div class="seccion">IVA</div>', unsafe_allow_html=True)
+
+        filas = []
+        for i in range(6):
+            fila = fila_bim1 + i
+            if fila >= len(iva_raw):
+                break
+
+            def num(col):
+                v = iva_raw.iat[fila, col]
+                return float(v) if isinstance(v, (int, float)) and not pd.isna(v) else 0.0
+
+            filas.append({
+                "Bimestre": str(iva_raw.iat[fila, 1]),
+                "Periodo": str(iva_raw.iat[fila, 2]),
+                "IVA generado": num(3),
+                "IVA descontable": num(4),
+                "ReteIVA": num(5),
+                "A pagar": num(6),
+                "Ya pagado": num(7),
+                "Diferencia": num(8),
+            })
+        tabla_iva = pd.DataFrame(filas)
+        activos = tabla_iva[(tabla_iva["IVA generado"] != 0)
+                            | (tabla_iva["IVA descontable"] != 0)]
+
+        if not activos.empty:
+            ki = st.columns(3)
+            ki[0].markdown(tarjeta("IVA generado", money(activos["IVA generado"].sum(), True),
+                                   "Facturas de venta"), unsafe_allow_html=True)
+            ki[1].markdown(tarjeta("IVA descontable",
+                                   money(activos["IVA descontable"].sum(), True),
+                                   "Facturas de compra"), unsafe_allow_html=True)
+            ki[2].markdown(tarjeta("Pendiente con la DIAN",
+                                   money(activos["Diferencia"].sum(), True),
+                                   "Calculado menos girado"), unsafe_allow_html=True)
+
+            fig = go.Figure()
+            fig.add_bar(x=activos["Periodo"], y=activos["IVA generado"],
+                        name="Generado", marker_color=VERDE,
+                        hovertemplate="%{x} · %{y:$,.0f}<extra>Generado</extra>")
+            fig.add_bar(x=activos["Periodo"], y=activos["IVA descontable"],
+                        name="Descontable", marker_color=AZUL,
+                        hovertemplate="%{x} · %{y:$,.0f}<extra>Descontable</extra>")
+            fig.add_bar(x=activos["Periodo"], y=activos["A pagar"],
+                        name="A pagar", marker_color=ARENA,
+                        hovertemplate="%{x} · %{y:$,.0f}<extra>A pagar</extra>")
+            fig.update_layout(barmode="group")
+            fig.update_yaxes(tickformat="$~s")
+            st.plotly_chart(estilo(fig, 320, "IVA por bimestre"),
+                            use_container_width=True, config=PLOTLY_CONF)
+
+            st.dataframe(
+                activos.style.format({
+                    "IVA generado": "${:,.0f}", "IVA descontable": "${:,.0f}",
+                    "ReteIVA": "${:,.0f}", "A pagar": "${:,.0f}",
+                    "Ya pagado": "${:,.0f}", "Diferencia": "${:,.0f}"}),
+                use_container_width=True, hide_index=True)
 
 # ─────────────────────── Composición del gasto ───────────────────────
 
