@@ -70,7 +70,10 @@ st.markdown(
       .block-container {padding-top: 2rem; padding-bottom: 3rem; max-width: 1320px;}
 
       .titulo {font-size: 1.85rem; font-weight: 680; color: #111827;
-               letter-spacing: -0.02em; margin-bottom: 1.4rem;}
+               letter-spacing: -0.02em; margin-bottom: .35rem;}
+      .corte {font-size: .82rem; color: #6b7280 !important; margin-bottom: 1.4rem;
+              padding: .4rem .7rem; background: #f7f8fa; border-radius: 6px;
+              display: inline-block;}
 
       .tarjeta {background: #ffffff; border: 1px solid #e5e7eb; border-radius: 10px;
                 padding: 1.05rem 1.2rem;}
@@ -113,6 +116,7 @@ st.markdown(
         .block-container {padding-left: .75rem !important; padding-right: .75rem !important;
                           padding-top: 1.2rem !important;}
         .titulo {font-size: 1.32rem;}
+        .corte {font-size: .74rem;}
         .seccion {font-size: 1rem; margin: 1.5rem 0 .6rem 0;}
         .tarjeta {padding: .8rem .9rem;}
         .tarjeta-titulo {font-size: .66rem; letter-spacing: .05em;}
@@ -281,7 +285,8 @@ def leer_tabla(origen, hoja, claves, fila_por_defecto):
     if isinstance(claves, str):
         claves = [claves]
     try:
-        crudo = pd.read_excel(origen, sheet_name=hoja, header=None, nrows=30)
+        crudo = pd.read_excel(origen, sheet_name=hoja, header=None, nrows=30,
+                              keep_default_na=False, na_values=[""])
         fila = fila_por_defecto
         for i in range(len(crudo)):
             valores = [str(v).strip() for v in crudo.iloc[i].tolist()]
@@ -290,7 +295,8 @@ def leer_tabla(origen, hoja, claves, fila_por_defecto):
                 break
         if hasattr(origen, "seek"):
             origen.seek(0)
-        return pd.read_excel(origen, sheet_name=hoja, header=fila)
+        return pd.read_excel(origen, sheet_name=hoja, header=fila,
+                             keep_default_na=False, na_values=[""])
     except Exception:
         return pd.DataFrame()
 
@@ -305,10 +311,12 @@ def columna_presente(df, opciones):
 
 @st.cache_data(show_spinner=False)
 def leer_hojas(origen):
-    mov = pd.read_excel(origen, sheet_name=HOJA_MOV)
+    mov = pd.read_excel(origen, sheet_name=HOJA_MOV,
+                        keep_default_na=False, na_values=[""])
     if hasattr(origen, "seek"):
         origen.seek(0)
-    data = pd.read_excel(origen, sheet_name=HOJA_DATA)
+    data = pd.read_excel(origen, sheet_name=HOJA_DATA,
+                         keep_default_na=False, na_values=[""])
     if hasattr(origen, "seek"):
         origen.seek(0)
     cxp = leer_tabla(origen, HOJA_CXP, ["Factura", "Numero"], CABECERA_CXP)
@@ -415,29 +423,57 @@ def preparar_cxc(bruto):
 
 
 def preparar_cxp(bruto):
+    """Devuelve el CxP completo y una marca de cuáles se muestran.
+
+    El P&G usa todas las facturas. La columna Dashboard solo decide qué se ve
+    en la sección de cuentas por pagar.
+    """
     if bruto.empty:
-        return pd.DataFrame(), 0.0, 0
+        return pd.DataFrame(), pd.Series(dtype=bool)
     clave = columna_presente(bruto, ["Factura", "Numero"])
     if clave is None:
-        return pd.DataFrame(), 0.0, 0
+        return pd.DataFrame(), pd.Series(dtype=bool)
     df = cortar_en_total(bruto, clave)
     if df.empty:
-        return df, 0.0, 0
+        return df, pd.Series(dtype=bool)
     df = numerico(df, ["Valor Producto", "IVA", "Valor Total", "Pagado", "Saldo"])
-    for c in ("Proveedor", "Cliente", "Proyecto", "Estado", "Alerta", "Dashboard"):
+    for c in ("Proveedor", "Cliente", "Proyecto", "Estado", "Alerta", "Dashboard", "Cuenta"):
         if c in df.columns:
             df[c] = texto(df[c])
     df["asignado"] = esta_asignado(df["Cliente"]) & esta_asignado(df["Proyecto"])
 
-    # La columna Dashboard del modelo decide que facturas se muestran.
-    # Las marcadas No siguen en el CxP, solo no aparecen aqui.
-    excluido, n_excluidas = 0.0, 0
+    if "Fecha Recepción" in df.columns:
+        df["mes_recepcion"] = pd.to_datetime(df["Fecha Recepción"],
+                                             errors="coerce").dt.month
+    else:
+        df["mes_recepcion"] = np.nan
+
     if "Dashboard" in df.columns:
-        fuera = df["Dashboard"].str.strip().str.lower().eq("no")
-        excluido = float(df.loc[fuera, "Valor Total"].sum())
-        n_excluidas = int(fuera.sum())
-        df = df[~fuera].copy()
-    return df, excluido, n_excluidas
+        mostrar = ~df["Dashboard"].str.strip().str.lower().eq("no")
+    else:
+        mostrar = pd.Series(True, index=df.index)
+    return df, mostrar
+
+
+CUENTAS_COSTO = ["Costo Ventas", "Costos Fijos", "Costos Operacionales",
+                 "Gastos Variables"]
+
+
+def costo_hibrido(cxp, mov, cuentas, meses):
+    """Costo del P&G: facturas del CxP más movimientos del extracto sin factura.
+
+    Cada costo entra una sola vez. Si la factura está en el CxP, el movimiento
+    que la paga no se cuenta; si no hay factura, el costo sale del extracto.
+    """
+    total = 0.0
+    if not cxp.empty and "Cuenta" in cxp.columns:
+        c = cxp[cxp["Cuenta"].isin(cuentas) & cxp["mes_recepcion"].isin(meses)]
+        total += -c["Valor Producto"].sum()
+
+    ext = mov[mov["cuenta"].isin(cuentas) & mov["mes_causacion"].isin(meses)]
+    sin_factura = ext["factura"].isna() | ext["factura"].astype(str).str.strip().eq("")
+    total += ext.loc[sin_factura, "valor_neto"].sum()
+    return total
 
 
 # ─────────────────────────── Encabezado ───────────────────────────
@@ -454,7 +490,36 @@ if origen is None:
 mov_raw, data_raw, cxp_raw, cxc_raw, proy_raw, iva_raw = leer_hojas(origen)
 df = preparar_movimientos(mov_raw, data_raw)
 cxc = preparar_cxc(cxc_raw)
-cxp, cxp_excluido, cxp_n_excl = preparar_cxp(cxp_raw)
+cxp, cxp_mostrar = preparar_cxp(cxp_raw)
+
+def fecha_larga(d):
+    if pd.isna(d):
+        return "—"
+    return f"{d.day} de {MESES.get(d.month, '').lower()}"
+
+
+def nota_corte(mov, cxc, cxp):
+    """Hasta qué fecha llega cada fuente de datos."""
+    partes = []
+    fm = pd.to_datetime(mov.get("fecha"), errors="coerce").max() if "fecha" in mov else pd.NaT
+    if pd.notna(fm):
+        partes.append(f"movimientos del banco al {fecha_larga(fm)}")
+    if not cxc.empty and "Fecha" in cxc.columns:
+        fc = pd.to_datetime(cxc["Fecha"], errors="coerce").max()
+        if pd.notna(fc):
+            partes.append(f"facturas emitidas al {fecha_larga(fc)}")
+    if not cxp.empty and "Fecha Recepción" in cxp.columns:
+        fp = pd.to_datetime(cxp["Fecha Recepción"], errors="coerce").max()
+        if pd.notna(fp):
+            partes.append(f"facturas recibidas al {fecha_larga(fp)}")
+    if not partes:
+        return ""
+    return "Información con corte a: " + " · ".join(partes) + "."
+
+
+corte = nota_corte(df, cxc, cxp)
+if corte:
+    st.markdown(f'<div class="corte">{corte}</div>', unsafe_allow_html=True)
 
 # ─────────────────────────── Filtro de mes ───────────────────────────
 
@@ -472,11 +537,9 @@ cxc_mes = cxc[cxc["Mes"].isin(sel_meses)] if not cxc.empty else cxc
 
 # El ingreso del P&G sale de las facturas emitidas, igual que en el modelo
 ingresos = cxc_mes["Base sin IVA"].sum() if not cxc_mes.empty else 0.0
-costo_ventas = f_pyg.loc[f_pyg["cuenta"].eq("Costo Ventas"), "valor_neto"].sum()
-gastos_op = f_pyg.loc[
-    f_pyg["cuenta"].isin(["Costos Fijos", "Costos Operacionales", "Gastos Variables"]),
-    "valor_neto",
-].sum()
+costo_ventas = costo_hibrido(cxp, df, ["Costo Ventas"], sel_meses)
+gastos_op = costo_hibrido(
+    cxp, df, ["Costos Fijos", "Costos Operacionales", "Gastos Variables"], sel_meses)
 margen_bruto = ingresos + costo_ventas
 resultado = margen_bruto + gastos_op
 margen_pct = (margen_bruto / ingresos * 100) if ingresos else 0
@@ -503,21 +566,18 @@ with g1:
 
     serie_ing = (cxc_mes.groupby("Mes")["Base sin IVA"].sum().reindex(orden).fillna(0)
                  if not cxc_mes.empty else pd.Series(0.0, index=orden))
-    tmp = f_pyg.assign(
-        grupo=np.where(f_pyg["cuenta"].eq("Costo Ventas"), "Costo de ventas", "Gastos")
-    )
-    tmp = tmp[tmp["cuenta"].isin(
-        ["Costo Ventas", "Costos Fijos", "Costos Operacionales", "Gastos Variables"])]
-    pyg = tmp.groupby(["mes_causacion", "grupo"])["valor_neto"].sum().reset_index()
+    serie_cv = [abs(costo_hibrido(cxp, df, ["Costo Ventas"], [m])) for m in orden]
+    serie_ga = [abs(costo_hibrido(
+        cxp, df, ["Costos Fijos", "Costos Operacionales", "Gastos Variables"], [m]))
+        for m in orden]
 
     fig = go.Figure()
     fig.add_bar(x=etiquetas, y=serie_ing.values, name="Ingresos facturados",
                 marker_color=VERDE,
                 hovertemplate="%{x} · %{y:$,.0f}<extra>Ingresos</extra>")
-    for nombre, color in [("Costo de ventas", ROJO), ("Gastos", ARENA)]:
-        sub = (pyg[pyg["grupo"].eq(nombre)]
-               .set_index("mes_causacion").reindex(orden)["valor_neto"].abs().fillna(0))
-        fig.add_bar(x=etiquetas, y=sub.values, name=nombre, marker_color=color,
+    for nombre, serie, color in [("Costo de ventas", serie_cv, ROJO),
+                                 ("Gastos", serie_ga, ARENA)]:
+        fig.add_bar(x=etiquetas, y=serie, name=nombre, marker_color=color,
                     hovertemplate="%{x} · %{y:$,.0f}<extra>" + nombre + "</extra>")
     fig.update_layout(barmode="group")
     fig.update_yaxes(tickformat="$~s")
@@ -565,7 +625,9 @@ def rentabilidad_facturas():
     ing = (cxc.groupby(["Cliente", "Proyecto"])["Base sin IVA"].sum()
            .rename("ingresos"))
     if not cxp.empty:
-        cos = (cxp[cxp["asignado"]].groupby(["Cliente", "Proyecto"])["Valor Producto"]
+        base = (cxp[cxp["Cuenta"].ne("Por clasificar")] if "Cuenta" in cxp.columns
+                else cxp[cxp["asignado"]])
+        cos = (base[base["asignado"]].groupby(["Cliente", "Proyecto"])["Valor Producto"]
                .sum().rename("costos"))
     else:
         cos = pd.Series(dtype=float, name="costos")
@@ -643,14 +705,17 @@ st.dataframe(
 
 # Aviso honesto: si faltan costos por asignar, el margen esta sobrestimado
 if enfoque == "Facturas" and not cxp.empty:
-    sin_asignar = cxp.loc[~cxp["asignado"], "Valor Producto"].sum()
+    if "Cuenta" in cxp.columns:
+        sin_asignar = cxp.loc[cxp["Cuenta"].eq("Por clasificar"), "Valor Producto"].sum()
+    else:
+        sin_asignar = cxp.loc[~cxp["asignado"], "Valor Producto"].sum()
     total_costo = cxp["Valor Producto"].sum()
     if sin_asignar > 0:
         pct = sin_asignar / total_costo * 100 if total_costo else 0
         st.warning(
-            f"Faltan {money(sin_asignar)} de costos por asignar a un proyecto "
-            f"({pct:.0f}% del total). Hasta completarlos, el margen de esta vista "
-            "queda por encima del real."
+            f"Hay {money(sin_asignar)} de costos sin cliente asignado "
+            f"({pct:.0f}% del total). No entran al P&G hasta completarlos, "
+            "así que el margen queda por encima del real."
         )
 
 # ─────────────────────── Cuentas por cobrar ───────────────────────
@@ -727,17 +792,21 @@ if not cxc.empty:
 if not cxp.empty:
     st.markdown('<div class="seccion">Cuentas por pagar</div>', unsafe_allow_html=True)
 
+    cxp_vista = cxp[cxp_mostrar]
+    n_ocultos = int((~cxp_mostrar).sum())
+    valor_oculto = float(cxp.loc[~cxp_mostrar, "Valor Total"].sum())
+
     fp1, fp2 = st.columns(2)
     with fp1:
-        op_prov = sorted(cxp["Proveedor"].unique())
+        op_prov = sorted(cxp_vista["Proveedor"].unique())
         sel_prov = filtro("Proveedor", op_prov, "f_cxp_prov")
     with fp2:
-        col_alerta = "Alerta" if "Alerta" in cxp.columns else "Estado"
-        op_est_p = sorted(cxp[col_alerta].astype(str).unique())
+        col_alerta = "Alerta" if "Alerta" in cxp_vista.columns else "Estado"
+        op_est_p = sorted(cxp_vista[col_alerta].astype(str).unique())
         sel_est_p = filtro(col_alerta, op_est_p, "f_cxp_est")
 
-    p = cxp[cxp["Proveedor"].isin(sel_prov)
-            & cxp[col_alerta].astype(str).isin(sel_est_p)]
+    p = cxp_vista[cxp_vista["Proveedor"].isin(sel_prov)
+                  & cxp_vista[col_alerta].astype(str).isin(sel_est_p)]
 
     if p.empty:
         st.info("No hay documentos con los filtros seleccionados.")
@@ -791,10 +860,10 @@ if not cxp.empty:
                     "Aparecen en la primera semana de la proyección de caja."
                 )
 
-        if cxp_n_excl:
+        if n_ocultos:
             st.caption(
-                f"No se muestran {cxp_n_excl} documentos marcados como No en el modelo "
-                f"({money(cxp_excluido)}). Siguen contando en el CxP."
+                f"No se muestran {n_ocultos} documentos marcados como No en el modelo "
+                f"({money(valor_oculto)}). Siguen contando en el CxP y en el P&G."
             )
 
         cols = [c for c in ["Fecha Recepción", "Factura", "Numero", "Proveedor", "Cliente",
@@ -934,6 +1003,75 @@ if not iva_raw.empty:
                     "ReteIVA": "${:,.0f}", "A pagar": "${:,.0f}",
                     "Ya pagado": "${:,.0f}", "Diferencia": "${:,.0f}"}),
                 use_container_width=True, hide_index=True)
+
+# ─────────────────────── Pendientes por asignar ───────────────────────
+
+SIN_PROYECTO = {"", "nan", "none", "revisar", "por asignar", "sin asignar"}
+
+
+def sin_asignar_cxp(cxp):
+    """Facturas de compra que aún no tienen cliente o proyecto."""
+    if cxp.empty:
+        return pd.DataFrame()
+    cli = cxp["Cliente"].astype(str).str.strip().str.lower()
+    proy = cxp["Proyecto"].astype(str).str.strip().str.lower()
+    # Cliente NA significa gasto de la operación, no es un pendiente
+    falta = cli.isin(SIN_PROYECTO) | (~cli.eq("na") & proy.isin(SIN_PROYECTO | {"na"}))
+    return cxp[falta]
+
+
+def sin_asignar_mov(mov):
+    """Movimientos de ingreso o costo de venta sin cliente o proyecto."""
+    base = mov[mov["cuenta"].isin(["Ingresos", "Costo Ventas"])]
+    cli = base["cliente"].astype(str).str.strip().str.lower()
+    proy = base["proyecto"].astype(str).str.strip().str.lower()
+    falta = cli.isin(SIN_PROYECTO | {"na"}) | proy.isin(SIN_PROYECTO | {"na"})
+    return base[falta]
+
+pend_cxp = sin_asignar_cxp(cxp)
+pend_mov = sin_asignar_mov(df)
+val_cxp = float(pend_cxp["Valor Producto"].sum()) if not pend_cxp.empty else 0.0
+val_mov = float(pend_mov["valor"].sum()) if not pend_mov.empty else 0.0
+
+if not pend_cxp.empty or not pend_mov.empty:
+    st.markdown('<div class="seccion">Pendientes por asignar</div>',
+                unsafe_allow_html=True)
+    st.caption(
+        "Facturas y movimientos que todavía no tienen cliente o proyecto. "
+        "Mientras estén así no aparecen en la rentabilidad por proyecto."
+    )
+
+    kx = st.columns(3)
+    kx[0].markdown(tarjeta("Facturas por asignar", money(val_cxp, True),
+                           f"{len(pend_cxp)} documentos"), unsafe_allow_html=True)
+    kx[1].markdown(tarjeta("Movimientos por asignar", money(abs(val_mov), True),
+                           f"{len(pend_mov)} movimientos"), unsafe_allow_html=True)
+    kx[2].markdown(tarjeta("Total", money(val_cxp + abs(val_mov), True),
+                           "Sin atribuir a un proyecto"), unsafe_allow_html=True)
+
+    if not pend_cxp.empty:
+        cols = [c for c in ["Fecha Recepción", "Factura", "Numero", "Proveedor",
+                            "Concepto/Rubro", "Valor Producto", "Cliente", "Proyecto"]
+                if c in pend_cxp.columns]
+        vista = pend_cxp[cols].copy()
+        if "Fecha Recepción" in vista.columns:
+            vista["Fecha Recepción"] = pd.to_datetime(
+                vista["Fecha Recepción"], errors="coerce").dt.strftime("%d/%m/%Y")
+        st.markdown("**Facturas de compra**")
+        st.dataframe(vista.style.format({"Valor Producto": "${:,.0f}"}),
+                     use_container_width=True, hide_index=True)
+
+    if not pend_mov.empty:
+        cols = [c for c in ["fecha", "descripcion", "valor", "cuenta",
+                            "cliente", "proyecto"] if c in pend_mov.columns]
+        vista = pend_mov[cols].copy()
+        vista.columns = [c.capitalize() for c in vista.columns]
+        if "Fecha" in vista.columns:
+            vista["Fecha"] = pd.to_datetime(vista["Fecha"],
+                                            errors="coerce").dt.strftime("%d/%m/%Y")
+        st.markdown("**Movimientos del extracto**")
+        st.dataframe(vista.style.format({"Valor": "${:,.0f}"}),
+                     use_container_width=True, hide_index=True)
 
 # ─────────────────────── Composición del gasto ───────────────────────
 
