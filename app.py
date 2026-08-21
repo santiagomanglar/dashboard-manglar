@@ -461,6 +461,16 @@ def preparar_cxp(bruto):
     else:
         df["mes_recepcion"] = np.nan
 
+    # Los días hasta el vencimiento se recalculan aquí.
+    # En el modelo esa columna a veces queda con formato de fecha y llega como
+    # una fecha de 1899 en vez de un número.
+    if "Vence" in df.columns:
+        vence = pd.to_datetime(df["Vence"], errors="coerce")
+        hoy = pd.Timestamp.today().normalize()
+        df["Días"] = (vence - hoy).dt.days
+    elif "Días" in df.columns:
+        df["Días"] = pd.to_numeric(df["Días"], errors="coerce")
+
     if "Dashboard" in df.columns:
         mostrar = ~df["Dashboard"].str.strip().str.lower().eq("no")
     else:
@@ -911,7 +921,8 @@ if not cxp.empty:
                 vista[c] = pd.to_datetime(vista[c], errors="coerce").dt.strftime("%d/%m/%Y")
         st.dataframe(
             vista.style.format({"Valor Total": "${:,.0f}", "Pagado": "${:,.0f}",
-                                "Saldo": "${:,.0f}", "Días": "{:.0f}"}),
+                                "Saldo": "${:,.0f}", "Días": "{:.0f}"},
+                               na_rep="—"),
             use_container_width=True, hide_index=True)
 
 # ─────────────────────── Proyección de caja ───────────────────────
