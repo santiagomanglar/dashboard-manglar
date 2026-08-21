@@ -309,8 +309,21 @@ def columna_presente(df, opciones):
     return None
 
 
+def firma_archivo(ruta):
+    """Identifica la versión del archivo por su fecha y tamaño.
+
+    Sin esto, la caché guarda los datos indefinidamente: la llave sería solo el
+    nombre del archivo, que no cambia aunque el contenido sí.
+    """
+    try:
+        s = os.stat(ruta)
+        return f"{int(s.st_mtime)}-{s.st_size}"
+    except Exception:
+        return "sin-archivo"
+
+
 @st.cache_data(show_spinner=False)
-def leer_hojas(origen):
+def leer_hojas(origen, firma=""):
     mov = pd.read_excel(origen, sheet_name=HOJA_MOV,
                         keep_default_na=False, na_values=[""])
     if hasattr(origen, "seek"):
@@ -487,7 +500,8 @@ if origen is None:
         st.stop()
     origen = io.BytesIO(subido.getvalue())
 
-mov_raw, data_raw, cxp_raw, cxc_raw, proy_raw, iva_raw = leer_hojas(origen)
+firma = firma_archivo(origen) if isinstance(origen, str) else "subido"
+mov_raw, data_raw, cxp_raw, cxc_raw, proy_raw, iva_raw = leer_hojas(origen, firma)
 df = preparar_movimientos(mov_raw, data_raw)
 cxc = preparar_cxc(cxc_raw)
 cxp, cxp_mostrar = preparar_cxp(cxp_raw)
@@ -520,6 +534,28 @@ def nota_corte(mov, cxc, cxp):
 corte = nota_corte(df, cxc, cxp)
 if corte:
     st.markdown(f'<div class="corte">{corte}</div>', unsafe_allow_html=True)
+
+with st.expander("Origen de los datos"):
+    if isinstance(origen, str):
+        st.write(f"**Archivo:** {origen}")
+        try:
+            s_os = os.stat(origen)
+            fecha = pd.Timestamp(s_os.st_mtime, unit="s").strftime("%d/%m/%Y %H:%M")
+            st.write(f"**Última modificación:** {fecha}")
+            st.write(f"**Tamaño:** {s_os.st_size:,} bytes")
+        except Exception:
+            st.write("No se pudo leer la fecha del archivo.")
+    else:
+        st.write("**Archivo:** cargado desde el navegador")
+
+    st.write(f"**Movimientos leídos:** {len(df):,}")
+    st.write(f"**Facturas emitidas (CxC):** {len(cxc):,}")
+    st.write(f"**Documentos recibidos (CxP):** {len(cxp):,}")
+    st.write(f"**Saldo en caja:** {money(df['valor'].sum())}")
+
+    if st.button("Recargar los datos"):
+        st.cache_data.clear()
+        st.rerun()
 
 # ─────────────────────────── Filtro de mes ───────────────────────────
 
