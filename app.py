@@ -652,17 +652,8 @@ with g2:
 
 st.markdown('<div class="seccion">Rentabilidad por cliente y proyecto</div>',
             unsafe_allow_html=True)
-
-fr1, fr2 = st.columns([1, 2])
-with fr1:
-    opciones_base = ["Facturas", "Movimientos"]
-    if hasattr(st, "segmented_control"):
-        enfoque = st.segmented_control("Base de cálculo", opciones_base,
-                                       default="Facturas", key="enfoque")
-        enfoque = enfoque or "Facturas"
-    else:
-        enfoque = st.radio("Base de cálculo", opciones_base, horizontal=True,
-                           key="enfoque")
+st.caption("Los ingresos vienen de las facturas emitidas y los costos de las "
+           "facturas recibidas, sin importar cuándo se cobran o se pagan.")
 
 
 def rentabilidad_facturas():
@@ -683,32 +674,14 @@ def rentabilidad_facturas():
     return r
 
 
-def rentabilidad_movimientos():
-    base = df[df["mes_causacion"].notna()]
-    r = (base.assign(
-            tipo=np.select([base["cuenta"].eq("Ingresos"),
-                            base["cuenta"].eq("Costo Ventas")],
-                           ["ingresos", "costos"], default="otro"))
-         .query("tipo != 'otro'")
-         .pivot_table(index=["cliente", "proyecto"], columns="tipo",
-                      values="valor_neto", aggfunc="sum", fill_value=0)
-         .reset_index())
-    for c in ("ingresos", "costos"):
-        if c not in r.columns:
-            r[c] = 0.0
-    return r[["cliente", "proyecto", "ingresos", "costos"]]
-
-
-rent = (rentabilidad_facturas() if enfoque == "Facturas"
-        else rentabilidad_movimientos())
+rent = rentabilidad_facturas()
 rent["neto"] = rent["ingresos"] + rent["costos"]
 rent["margen"] = np.where(rent["ingresos"] > 0,
                           rent["neto"] / rent["ingresos"] * 100, np.nan)
 
 clientes_disp = sorted(c for c in rent["cliente"].unique()
                        if str(c).lower() not in SIN_ASIGNAR)
-with fr2:
-    sel_clientes = filtro("Cliente", clientes_disp, "f_rent_cli")
+sel_clientes = filtro("Cliente", clientes_disp, "f_rent_cli")
 rent = rent[rent["cliente"].isin(sel_clientes)]
 
 r1, r2 = st.columns([1.25, 1])
@@ -750,7 +723,7 @@ st.dataframe(
 )
 
 # Aviso honesto: si faltan costos por asignar, el margen esta sobrestimado
-if enfoque == "Facturas" and not cxp.empty:
+if not cxp.empty:
     if "Cuenta" in cxp.columns:
         sin_asignar = cxp.loc[cxp["Cuenta"].eq("Por clasificar"), "Valor Producto"].sum()
     else:
