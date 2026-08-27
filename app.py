@@ -487,11 +487,16 @@ def costo_hibrido(cxp, mov, cuentas, meses):
 
     Cada costo entra una sola vez. Si la factura está en el CxP, el movimiento
     que la paga no se cuenta; si no hay factura, el costo sale del extracto.
+    Las facturas marcadas No en la columna Aplica al P&G quedan fuera.
     """
     total = 0.0
     if not cxp.empty and "Cuenta" in cxp.columns:
         c = cxp[cxp["Cuenta"].isin(cuentas) & cxp["mes_recepcion"].isin(meses)]
+        if "Aplica al P&G" in c.columns:
+            c = c[~c["Aplica al P&G"].astype(str).str.strip().str.lower().eq("no")]
         total += -c["Valor Producto"].sum()
+        if "Otros impuestos" in c.columns:
+            total += -c["Otros impuestos"].sum()
 
     ext = mov[mov["cuenta"].isin(cuentas) & mov["mes_causacion"].isin(meses)]
     sin_factura = ext["factura"].isna() | ext["factura"].astype(str).str.strip().eq("")
@@ -664,6 +669,8 @@ def rentabilidad_facturas():
     if not cxp.empty:
         base = (cxp[cxp["Cuenta"].ne("Por clasificar")] if "Cuenta" in cxp.columns
                 else cxp[cxp["asignado"]])
+        if "Aplica al P&G" in base.columns:
+            base = base[~base["Aplica al P&G"].astype(str).str.strip().str.lower().eq("no")]
         cos = (base[base["asignado"]].groupby(["Cliente", "Proyecto"])["Valor Producto"]
                .sum().rename("costos"))
     else:
@@ -736,6 +743,15 @@ if not cxp.empty:
             f"({pct:.0f}% del total). No entran al P&G hasta completarlos, "
             "así que el margen queda por encima del real."
         )
+
+    if "Aplica al P&G" in cxp.columns:
+        fuera_pyg = cxp["Aplica al P&G"].astype(str).str.strip().str.lower().eq("no")
+        val_fuera = float(cxp.loc[fuera_pyg, "Valor Producto"].sum())
+        if fuera_pyg.any() and abs(val_fuera) > 0:
+            st.caption(
+                f"No se cuentan {money(val_fuera)} de {int(fuera_pyg.sum())} facturas "
+                "marcadas como No en la columna Aplica al P&G del modelo."
+            )
 
 # ─────────────────────── Cuentas por cobrar ───────────────────────
 
