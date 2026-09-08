@@ -44,6 +44,9 @@ MESES = {
 # Valores que significan "todavia no se asigno"
 SIN_ASIGNAR = {"", "nan", "none", "na", "revisar", "por asignar", "sin asignar"}
 
+# Cuántos días antes del vencimiento se marca como "Por vencer"
+DIAS_AVISO = 15
+
 TINTA = "#111827"
 GRIS = "#6b7280"
 GRIS_SUAVE = "#e5e7eb"
@@ -461,13 +464,22 @@ def preparar_cxp(bruto):
     else:
         df["mes_recepcion"] = np.nan
 
-    # Los días hasta el vencimiento se recalculan aquí.
-    # En el modelo esa columna a veces queda con formato de fecha y llega como
-    # una fecha de 1899 en vez de un número.
+    # Los días hasta el vencimiento y el estado se recalculan aquí, contra la
+    # fecha de hoy. Así el aging avanza solo aunque el modelo no se actualice.
     if "Vence" in df.columns:
         vence = pd.to_datetime(df["Vence"], errors="coerce")
         hoy = pd.Timestamp.today().normalize()
         df["Días"] = (vence - hoy).dt.days
+
+        anulada = (df["Notas"].astype(str).str.contains("Anula", case=False, na=False)
+                   if "Notas" in df.columns else pd.Series(False, index=df.index))
+        saldada = df["Saldo"].abs() <= 1000
+        sin_fecha = vence.isna()
+
+        df["Alerta"] = np.select(
+            [anulada, saldada, sin_fecha, df["Días"] < 0, df["Días"] <= DIAS_AVISO],
+            ["Anulada", "Al dia", "Sin fecha", "Vencida", "Por vencer"],
+            default="Vigente")
     elif "Días" in df.columns:
         df["Días"] = pd.to_numeric(df["Días"], errors="coerce")
 
@@ -508,12 +520,53 @@ def costo_hibrido(cxp, mov, cuentas, meses):
 
 st.markdown('<div class="titulo">Dashboard Manglar — 2026</div>', unsafe_allow_html=True)
 
-origen = ARCHIVO_MODELO if os.path.exists(ARCHIVO_MODELO) else None
-if origen is None:
-    subido = st.file_uploader("Cargue el modelo financiero (.xlsx)", type=["xlsx"])
-    if subido is None:
-        st.stop()
-    origen = io.BytesIO(subido.getvalue())
+ARCHIVO_SUBIDO = "modelo_subido.xlsx"
+
+
+def guardar_subido(datos):
+    """Guarda el modelo que se sube desde el navegador.
+
+    Queda disponible para todos hasta que la aplicación se reinicie, que pasa
+    cuando se publica un cambio o tras un rato sin uso. Para que sea
+    permanente, hay que subirlo también al repositorio.
+    """
+    try:
+        with open(ARCHIVO_SUBIDO, "wb") as fh:
+            fh.write(datos)
+        return True
+    except Exception:
+        return False
+
+
+with st.expander("Actualizar el modelo"):
+    st.caption("Suba el Excel para actualizar las cifras. Queda disponible "
+               "para todos hasta el próximo reinicio de la aplicación.")
+    nuevo = st.file_uploader("Modelo financiero (.xlsx)", type=["xlsx"],
+                             key="subir_modelo", label_visibility="collapsed")
+    if nuevo is not None:
+        if guardar_subido(nuevo.getvalue()):
+            st.cache_data.clear()
+            st.success("Modelo actualizado.")
+        else:
+            st.error("No se pudo guardar el archivo.")
+
+    if os.path.exists(ARCHIVO_SUBIDO):
+        s_sub = os.stat(ARCHIVO_SUBIDO)
+        st.caption("En uso: el archivo subido el "
+                   + pd.Timestamp(s_sub.st_mtime, unit="s").strftime("%d/%m/%Y %H:%M"))
+        if st.button("Volver al archivo del repositorio"):
+            os.remove(ARCHIVO_SUBIDO)
+            st.cache_data.clear()
+            st.rerun()
+
+# El archivo subido manda sobre el del repositorio
+if os.path.exists(ARCHIVO_SUBIDO):
+    origen = ARCHIVO_SUBIDO
+elif os.path.exists(ARCHIVO_MODELO):
+    origen = ARCHIVO_MODELO
+else:
+    st.info("Suba el modelo financiero para ver las cifras.")
+    st.stop()
 
 firma = firma_archivo(origen) if isinstance(origen, str) else "subido"
 mov_raw, data_raw, cxp_raw, cxc_raw, proy_raw, iva_raw = leer_hojas(origen, firma)
@@ -603,7 +656,9 @@ k[1].markdown(tarjeta("Ingresos", money(ingresos, True), "Facturado, neto de IVA
               unsafe_allow_html=True)
 k[2].markdown(tarjeta("Margen bruto", money(margen_bruto, True),
                       f"{margen_pct:.1f}% sobre ingresos"), unsafe_allow_html=True)
-k[3].markdown(tarjeta("Resultado operativo", money(resultado, True), "Después de gastos"),
+resultado_pct = (resultado / ingresos * 100) if ingresos else 0
+k[3].markdown(tarjeta("Resultado operativo", money(resultado, True),
+                      f"{resultado_pct:.1f}% sobre ingresos"),
               unsafe_allow_html=True)
 
 # ─────────────────────── Resultado y caja ───────────────────────
@@ -821,6 +876,146 @@ if not cxc.empty:
             vista.style.format({"Total Facturado": "${:,.0f}", "Retenciones": "${:,.0f}",
                                 "Cobrado": "${:,.0f}", "Saldo Pendiente": "${:,.0f}"}),
             use_container_width=True, hide_index=True)
+
+# ─────────────────── Alertas de vencimiento (CxP) ───────────────────
+
+if not cxp.empty and "Alerta" in cxp.columns:
+    st.markdown('<div class="seccion">Alertas de vencimiento</div>',
+                unsafe_allow_html=True)
+    st.caption(f"Los días se calculan contra hoy, {pd.Timestamp.today().strftime('%d/%m/%Y')}, "
+               "así que el vencimiento avanza aunque el modelo no se actualice.")
+
+    pend = cxp[cxp_mostrar & (cxp["Saldo"] > 1000)
+               & ~cxp["Alerta"].isin(["Anulada", "Al dia"])].copy()
+
+    if pend.empty:
+        st.info("No hay facturas pendientes de pago.")
+    else:
+        orden = ["Vencida", "Por vencer", "Vigente", "Sin fecha"]
+        res = (pend.groupby("Alerta")
+               .agg(facturas=("Saldo", "size"), saldo=("Saldo", "sum")))
+        res = res.reindex([o for o in orden if o in res.index])
+
+        ka = st.columns(len(res) + 1)
+        colores = {"Vencida": ROJO, "Por vencer": ARENA, "Vigente": VERDE,
+                   "Sin fecha": GRIS}
+        for i, (est, fila) in enumerate(res.iterrows()):
+            nota = f"{int(fila['facturas'])} factura(s)"
+            if est == "Vencida" and pend["Días"].notna().any():
+                nota += f" · hasta {int(abs(pend['Días'].min()))} días"
+            ka[i].markdown(tarjeta(est, money(fila["saldo"], True), nota),
+                           unsafe_allow_html=True)
+        ka[-1].markdown(tarjeta("Total pendiente", money(pend["Saldo"].sum(), True),
+                                f"{len(pend)} facturas"), unsafe_allow_html=True)
+
+        # A quién se le debe
+        prov = (pend.groupby("Proveedor")
+                .agg(facturas=("Saldo", "size"), saldo=("Saldo", "sum"),
+                     peor=("Días", "min"))
+                .sort_values("saldo", ascending=False).reset_index())
+
+        def situacion(d):
+            if pd.isna(d):
+                return "sin fecha"
+            d = int(d)
+            if d < 0:
+                return f"vencida hace {abs(d)} días"
+            if d == 0:
+                return "vence hoy"
+            return f"vence en {d} días"
+
+        prov["situacion"] = prov["peor"].apply(situacion)
+        vista_prov = prov[["Proveedor", "facturas", "saldo", "situacion"]].copy()
+        vista_prov.columns = ["Proveedor", "Facturas", "Saldo", "Situación"]
+        st.markdown("**A quién se le debe**")
+        st.dataframe(vista_prov.style.format({"Saldo": "${:,.0f}"}),
+                     use_container_width=True, hide_index=True)
+
+        # Envío del resumen por correo
+        def texto_cxp():
+            l = ["CUENTAS POR PAGAR — MANGLAR",
+                 pd.Timestamp.today().strftime("%d/%m/%Y"), ""]
+            for est, fila in res.iterrows():
+                l.append(f"{est}: {int(fila['facturas'])} por {money(fila['saldo'])}")
+            l += ["", f"Total pendiente: {money(pend['Saldo'].sum())}", "",
+                  "A QUIEN SE LE DEBE"]
+            for _, x in prov.iterrows():
+                l.append(f"  {x['Proveedor']} | {int(x['facturas'])} factura(s) | "
+                         f"{money(x['saldo'])} | {x['situacion']}")
+            l += ["", corte or ""]
+            return "\n".join(l)
+
+        def html_cxp():
+            filas = ""
+            for _, x in prov.iterrows():
+                col = ROJO if "vencida" in x["situacion"] else "#111827"
+                filas += ('<tr style="border-top:1px solid #e5e7eb">'
+                          f'<td style="padding:7px 10px 7px 0"><strong>{x["Proveedor"]}</strong></td>'
+                          f'<td style="padding:7px 10px 7px 0;text-align:right">{int(x["facturas"])}</td>'
+                          f'<td style="padding:7px 10px 7px 0;text-align:right"><strong>{money(x["saldo"])}</strong></td>'
+                          f'<td style="padding:7px 0;color:{col}">{x["situacion"]}</td></tr>')
+            resumen_html = ""
+            for est, fila in res.iterrows():
+                resumen_html += (f'<tr><td style="padding:5px 18px 5px 0;color:#6b7280">{est}</td>'
+                                 f'<td style="padding:5px 18px 5px 0;text-align:right">{int(fila["facturas"])}</td>'
+                                 f'<td style="padding:5px 0;text-align:right;font-weight:650">'
+                                 f'{money(fila["saldo"])}</td></tr>')
+            return ('<div style="font-family:Arial,sans-serif;color:#111827;max-width:720px">'
+                    '<h2 style="font-size:19px;margin:0 0 4px 0">Cuentas por pagar</h2>'
+                    f'<div style="font-size:13px;color:#6b7280;margin-bottom:18px">Manglar · '
+                    f'{pd.Timestamp.today().strftime("%d/%m/%Y")}</div>'
+                    f'<table style="border-collapse:collapse;font-size:13px;margin-bottom:20px">'
+                    f'{resumen_html}</table>'
+                    '<h3 style="font-size:14px;margin:18px 0 8px 0;padding-bottom:5px;'
+                    'border-bottom:2px solid #41607f">A quién se le debe</h3>'
+                    '<table style="border-collapse:collapse;width:100%;font-size:13px">'
+                    '<tr style="color:#6b7280;text-align:left">'
+                    '<th style="padding:6px 10px 6px 0">Proveedor</th>'
+                    '<th style="padding:6px 10px 6px 0;text-align:right">Facturas</th>'
+                    '<th style="padding:6px 10px 6px 0;text-align:right">Saldo</th>'
+                    '<th style="padding:6px 0">Situación</th></tr>'
+                    f'{filas}</table>'
+                    f'<div style="font-size:12px;color:#6b7280;margin-top:22px;'
+                    f'padding-top:10px;border-top:1px solid #e5e7eb">{corte or ""}</div></div>')
+
+        def enviar_correo(asunto, texto, html, destinatarios):
+            import smtplib
+            from email.mime.text import MIMEText
+            from email.mime.multipart import MIMEMultipart
+            remitente = st.secrets["correo"]["usuario"]
+            clave = st.secrets["correo"]["clave"]
+            msg = MIMEMultipart("alternative")
+            msg["Subject"] = asunto
+            msg["From"] = remitente
+            msg["To"] = ", ".join(destinatarios)
+            msg.attach(MIMEText(texto, "plain", "utf-8"))
+            msg.attach(MIMEText(html, "html", "utf-8"))
+            with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
+                s.login(remitente, clave)
+                s.sendmail(remitente, destinatarios, msg.as_string())
+
+        with st.expander("Enviar este resumen por correo"):
+            try:
+                para_def = st.secrets["correo"].get("destinatarios", "")
+            except Exception:
+                para_def = ""
+            para = st.text_input("Destinatarios (separados por coma)", value=para_def)
+            n_venc = int(res.loc["Vencida", "facturas"]) if "Vencida" in res.index else 0
+            asunto = (f"Manglar · Cuentas por pagar · {n_venc} vencidas" if n_venc
+                      else "Manglar · Cuentas por pagar")
+            st.caption(f"Asunto: {asunto}")
+            if st.button("Enviar", type="primary"):
+                if not para.strip():
+                    st.warning("Escriba al menos un destinatario.")
+                else:
+                    try:
+                        enviar_correo(asunto, texto_cxp(), html_cxp(),
+                                      [d.strip() for d in para.split(",") if d.strip()])
+                        st.success("Correo enviado.")
+                    except KeyError:
+                        st.error("Falta configurar el correo en los secretos. Ver el README.")
+                    except Exception as e:
+                        st.error(f"No se pudo enviar: {e}")
 
 # ─────────────────────── Cuentas por pagar ───────────────────────
 
