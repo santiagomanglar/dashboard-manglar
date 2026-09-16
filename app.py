@@ -386,7 +386,7 @@ def preparar_movimientos(mov, data):
         "Fecha": "fecha", "Descripción banco": "descripcion", "Valor": "valor",
         "Categoría": "categoria", "Mes Caja": "mes_caja", "Cliente": "cliente",
         "Proyecto": "proyecto", "IVA?": "iva", "Mes (Causación P&G)": "mes_causacion",
-        "Factura": "factura",
+        "Factura": "factura", "Centro de costo": "centro",
     }
     df = df.rename(columns={k: v for k, v in equivalencias.items() if k in df.columns})
 
@@ -396,7 +396,7 @@ def preparar_movimientos(mov, data):
         st.stop()
 
     for col in ("cliente", "proyecto", "iva", "mes_causacion", "descripcion",
-                "fecha", "factura"):
+                "fecha", "factura", "centro"):
         if col not in df.columns:
             df[col] = np.nan
 
@@ -520,52 +520,10 @@ def costo_hibrido(cxp, mov, cuentas, meses):
 
 st.markdown('<div class="titulo">Dashboard Manglar — 2026</div>', unsafe_allow_html=True)
 
-ARCHIVO_SUBIDO = "modelo_subido.xlsx"
-
-
-def guardar_subido(datos):
-    """Guarda el modelo que se sube desde el navegador.
-
-    Queda disponible para todos hasta que la aplicación se reinicie, que pasa
-    cuando se publica un cambio o tras un rato sin uso. Para que sea
-    permanente, hay que subirlo también al repositorio.
-    """
-    try:
-        with open(ARCHIVO_SUBIDO, "wb") as fh:
-            fh.write(datos)
-        return True
-    except Exception:
-        return False
-
-
-with st.expander("Actualizar el modelo"):
-    st.caption("Suba el Excel para actualizar las cifras. Queda disponible "
-               "para todos hasta el próximo reinicio de la aplicación.")
-    nuevo = st.file_uploader("Modelo financiero (.xlsx)", type=["xlsx"],
-                             key="subir_modelo", label_visibility="collapsed")
-    if nuevo is not None:
-        if guardar_subido(nuevo.getvalue()):
-            st.cache_data.clear()
-            st.success("Modelo actualizado.")
-        else:
-            st.error("No se pudo guardar el archivo.")
-
-    if os.path.exists(ARCHIVO_SUBIDO):
-        s_sub = os.stat(ARCHIVO_SUBIDO)
-        st.caption("En uso: el archivo subido el "
-                   + pd.Timestamp(s_sub.st_mtime, unit="s").strftime("%d/%m/%Y %H:%M"))
-        if st.button("Volver al archivo del repositorio"):
-            os.remove(ARCHIVO_SUBIDO)
-            st.cache_data.clear()
-            st.rerun()
-
-# El archivo subido manda sobre el del repositorio
-if os.path.exists(ARCHIVO_SUBIDO):
-    origen = ARCHIVO_SUBIDO
-elif os.path.exists(ARCHIVO_MODELO):
+if os.path.exists(ARCHIVO_MODELO):
     origen = ARCHIVO_MODELO
 else:
-    st.info("Suba el modelo financiero para ver las cifras.")
+    st.info("No se encontró el modelo financiero.")
     st.stop()
 
 firma = firma_archivo(origen) if isinstance(origen, str) else "subido"
@@ -808,6 +766,103 @@ if not cxp.empty:
                 "marcadas como No en la columna Aplica al P&G del modelo."
             )
 
+# ─────────────────── Alertas de vencimiento ───────────────────
+
+st.markdown('<div class="seccion">Alertas de vencimiento</div>',
+            unsafe_allow_html=True)
+st.caption(f"Los días se calculan contra hoy, {pd.Timestamp.today().strftime('%d/%m/%Y')}, "
+           "así que el vencimiento avanza aunque el modelo no se actualice.")
+
+
+def situacion(d):
+    """Traduce los días restantes a una frase."""
+    if pd.isna(d):
+        return "sin fecha"
+    d = int(d)
+    if d < 0:
+        return f"vencida hace {abs(d)} días"
+    if d == 0:
+        return "vence hoy"
+    return f"vence en {d} días"
+
+
+ORDEN_ALERTA = ["Vencida", "Por vencer", "Vigente", "Sin fecha"]
+COLOR_ALERTA = {"Vencida": ROJO, "Por vencer": ARENA, "Vigente": VERDE,
+                "Sin fecha": GRIS}
+
+
+def resumen_alertas(base, col_saldo, col_dias):
+    """Agrupa por estado y devuelve el resumen ordenado."""
+    r = (base.groupby("estado")
+         .agg(facturas=(col_saldo, "size"), saldo=(col_saldo, "sum")))
+    return r.reindex([o for o in ORDEN_ALERTA if o in r.index])
+
+
+def tarjetas_alertas(base, res, etiqueta_total, col_dias):
+    cols = st.columns(len(res) + 1)
+    for i, (est, fila) in enumerate(res.iterrows()):
+        nota = f"{int(fila['facturas'])} factura(s)"
+        if est == "Vencida" and base[col_dias].notna().any():
+            peor = base.loc[base["estado"].eq("Vencida"), col_dias].min()
+            if pd.notna(peor):
+                nota += f" · hasta {int(abs(peor))} días"
+        cols[i].markdown(tarjeta(est, money(fila["saldo"], True), nota),
+                         unsafe_allow_html=True)
+    cols[-1].markdown(tarjeta(etiqueta_total, money(base[col_saldo_g].sum(), True),
+                              f"{len(base)} facturas"), unsafe_allow_html=True)
+
+
+# ── Por cobrar ──
+col_saldo_g = "Saldo Pendiente"
+if not cxc.empty and "Saldo Pendiente" in cxc.columns:
+    hoy_ = pd.Timestamp.today().normalize()
+    c = cxc[cxc["Saldo Pendiente"] > 1000].copy()
+    if not c.empty:
+        venc_c = pd.to_datetime(c["Fecha Vence"], errors="coerce")
+        c["dias"] = (venc_c - hoy_).dt.days
+        c["estado"] = np.select(
+            [venc_c.isna(), c["dias"] < 0, c["dias"] <= DIAS_AVISO],
+            ["Sin fecha", "Vencida", "Por vencer"], default="Vigente")
+        c["situacion"] = c["dias"].apply(situacion)
+
+        st.markdown("**Por cobrar a clientes**")
+        res_c = resumen_alertas(c, "Saldo Pendiente", "dias")
+        tarjetas_alertas(c, res_c, "Total por cobrar", "dias")
+
+        cli_col = "Cliente" if "Cliente" in c.columns else c.columns[0]
+        det_c = (c.groupby(cli_col)
+                 .agg(Facturas=("Saldo Pendiente", "size"),
+                      Saldo=("Saldo Pendiente", "sum"), peor=("dias", "min"))
+                 .sort_values("Saldo", ascending=False).reset_index())
+        det_c["Situación"] = det_c["peor"].apply(situacion)
+        det_c = det_c[[cli_col, "Facturas", "Saldo", "Situación"]]
+        det_c.columns = ["Cliente", "Facturas", "Saldo", "Situación"]
+        st.dataframe(det_c.style.format({"Saldo": "${:,.0f}"}),
+                     use_container_width=True, hide_index=True)
+
+# ── Por pagar ──
+col_saldo_g = "Saldo"
+if not cxp.empty and "Alerta" in cxp.columns:
+    pend = cxp[cxp_mostrar & (cxp["Saldo"] > 1000)
+               & ~cxp["Alerta"].isin(["Anulada", "Al dia"])].copy()
+    if not pend.empty:
+        pend["estado"] = pend["Alerta"]
+        pend["situacion"] = pend["Días"].apply(situacion)
+
+        st.markdown("**Por pagar a proveedores**")
+        res_p = resumen_alertas(pend, "Saldo", "Días")
+        tarjetas_alertas(pend, res_p, "Total por pagar", "Días")
+
+        det_p = (pend.groupby("Proveedor")
+                 .agg(Facturas=("Saldo", "size"), Saldo=("Saldo", "sum"),
+                      peor=("Días", "min"))
+                 .sort_values("Saldo", ascending=False).reset_index())
+        det_p["Situación"] = det_p["peor"].apply(situacion)
+        det_p = det_p[["Proveedor", "Facturas", "Saldo", "Situación"]]
+        st.dataframe(det_p.style.format({"Saldo": "${:,.0f}"}),
+                     use_container_width=True, hide_index=True)
+
+
 # ─────────────────────── Cuentas por cobrar ───────────────────────
 
 if not cxc.empty:
@@ -876,146 +931,6 @@ if not cxc.empty:
             vista.style.format({"Total Facturado": "${:,.0f}", "Retenciones": "${:,.0f}",
                                 "Cobrado": "${:,.0f}", "Saldo Pendiente": "${:,.0f}"}),
             use_container_width=True, hide_index=True)
-
-# ─────────────────── Alertas de vencimiento (CxP) ───────────────────
-
-if not cxp.empty and "Alerta" in cxp.columns:
-    st.markdown('<div class="seccion">Alertas de vencimiento</div>',
-                unsafe_allow_html=True)
-    st.caption(f"Los días se calculan contra hoy, {pd.Timestamp.today().strftime('%d/%m/%Y')}, "
-               "así que el vencimiento avanza aunque el modelo no se actualice.")
-
-    pend = cxp[cxp_mostrar & (cxp["Saldo"] > 1000)
-               & ~cxp["Alerta"].isin(["Anulada", "Al dia"])].copy()
-
-    if pend.empty:
-        st.info("No hay facturas pendientes de pago.")
-    else:
-        orden = ["Vencida", "Por vencer", "Vigente", "Sin fecha"]
-        res = (pend.groupby("Alerta")
-               .agg(facturas=("Saldo", "size"), saldo=("Saldo", "sum")))
-        res = res.reindex([o for o in orden if o in res.index])
-
-        ka = st.columns(len(res) + 1)
-        colores = {"Vencida": ROJO, "Por vencer": ARENA, "Vigente": VERDE,
-                   "Sin fecha": GRIS}
-        for i, (est, fila) in enumerate(res.iterrows()):
-            nota = f"{int(fila['facturas'])} factura(s)"
-            if est == "Vencida" and pend["Días"].notna().any():
-                nota += f" · hasta {int(abs(pend['Días'].min()))} días"
-            ka[i].markdown(tarjeta(est, money(fila["saldo"], True), nota),
-                           unsafe_allow_html=True)
-        ka[-1].markdown(tarjeta("Total pendiente", money(pend["Saldo"].sum(), True),
-                                f"{len(pend)} facturas"), unsafe_allow_html=True)
-
-        # A quién se le debe
-        prov = (pend.groupby("Proveedor")
-                .agg(facturas=("Saldo", "size"), saldo=("Saldo", "sum"),
-                     peor=("Días", "min"))
-                .sort_values("saldo", ascending=False).reset_index())
-
-        def situacion(d):
-            if pd.isna(d):
-                return "sin fecha"
-            d = int(d)
-            if d < 0:
-                return f"vencida hace {abs(d)} días"
-            if d == 0:
-                return "vence hoy"
-            return f"vence en {d} días"
-
-        prov["situacion"] = prov["peor"].apply(situacion)
-        vista_prov = prov[["Proveedor", "facturas", "saldo", "situacion"]].copy()
-        vista_prov.columns = ["Proveedor", "Facturas", "Saldo", "Situación"]
-        st.markdown("**A quién se le debe**")
-        st.dataframe(vista_prov.style.format({"Saldo": "${:,.0f}"}),
-                     use_container_width=True, hide_index=True)
-
-        # Envío del resumen por correo
-        def texto_cxp():
-            l = ["CUENTAS POR PAGAR — MANGLAR",
-                 pd.Timestamp.today().strftime("%d/%m/%Y"), ""]
-            for est, fila in res.iterrows():
-                l.append(f"{est}: {int(fila['facturas'])} por {money(fila['saldo'])}")
-            l += ["", f"Total pendiente: {money(pend['Saldo'].sum())}", "",
-                  "A QUIEN SE LE DEBE"]
-            for _, x in prov.iterrows():
-                l.append(f"  {x['Proveedor']} | {int(x['facturas'])} factura(s) | "
-                         f"{money(x['saldo'])} | {x['situacion']}")
-            l += ["", corte or ""]
-            return "\n".join(l)
-
-        def html_cxp():
-            filas = ""
-            for _, x in prov.iterrows():
-                col = ROJO if "vencida" in x["situacion"] else "#111827"
-                filas += ('<tr style="border-top:1px solid #e5e7eb">'
-                          f'<td style="padding:7px 10px 7px 0"><strong>{x["Proveedor"]}</strong></td>'
-                          f'<td style="padding:7px 10px 7px 0;text-align:right">{int(x["facturas"])}</td>'
-                          f'<td style="padding:7px 10px 7px 0;text-align:right"><strong>{money(x["saldo"])}</strong></td>'
-                          f'<td style="padding:7px 0;color:{col}">{x["situacion"]}</td></tr>')
-            resumen_html = ""
-            for est, fila in res.iterrows():
-                resumen_html += (f'<tr><td style="padding:5px 18px 5px 0;color:#6b7280">{est}</td>'
-                                 f'<td style="padding:5px 18px 5px 0;text-align:right">{int(fila["facturas"])}</td>'
-                                 f'<td style="padding:5px 0;text-align:right;font-weight:650">'
-                                 f'{money(fila["saldo"])}</td></tr>')
-            return ('<div style="font-family:Arial,sans-serif;color:#111827;max-width:720px">'
-                    '<h2 style="font-size:19px;margin:0 0 4px 0">Cuentas por pagar</h2>'
-                    f'<div style="font-size:13px;color:#6b7280;margin-bottom:18px">Manglar · '
-                    f'{pd.Timestamp.today().strftime("%d/%m/%Y")}</div>'
-                    f'<table style="border-collapse:collapse;font-size:13px;margin-bottom:20px">'
-                    f'{resumen_html}</table>'
-                    '<h3 style="font-size:14px;margin:18px 0 8px 0;padding-bottom:5px;'
-                    'border-bottom:2px solid #41607f">A quién se le debe</h3>'
-                    '<table style="border-collapse:collapse;width:100%;font-size:13px">'
-                    '<tr style="color:#6b7280;text-align:left">'
-                    '<th style="padding:6px 10px 6px 0">Proveedor</th>'
-                    '<th style="padding:6px 10px 6px 0;text-align:right">Facturas</th>'
-                    '<th style="padding:6px 10px 6px 0;text-align:right">Saldo</th>'
-                    '<th style="padding:6px 0">Situación</th></tr>'
-                    f'{filas}</table>'
-                    f'<div style="font-size:12px;color:#6b7280;margin-top:22px;'
-                    f'padding-top:10px;border-top:1px solid #e5e7eb">{corte or ""}</div></div>')
-
-        def enviar_correo(asunto, texto, html, destinatarios):
-            import smtplib
-            from email.mime.text import MIMEText
-            from email.mime.multipart import MIMEMultipart
-            remitente = st.secrets["correo"]["usuario"]
-            clave = st.secrets["correo"]["clave"]
-            msg = MIMEMultipart("alternative")
-            msg["Subject"] = asunto
-            msg["From"] = remitente
-            msg["To"] = ", ".join(destinatarios)
-            msg.attach(MIMEText(texto, "plain", "utf-8"))
-            msg.attach(MIMEText(html, "html", "utf-8"))
-            with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
-                s.login(remitente, clave)
-                s.sendmail(remitente, destinatarios, msg.as_string())
-
-        with st.expander("Enviar este resumen por correo"):
-            try:
-                para_def = st.secrets["correo"].get("destinatarios", "")
-            except Exception:
-                para_def = ""
-            para = st.text_input("Destinatarios (separados por coma)", value=para_def)
-            n_venc = int(res.loc["Vencida", "facturas"]) if "Vencida" in res.index else 0
-            asunto = (f"Manglar · Cuentas por pagar · {n_venc} vencidas" if n_venc
-                      else "Manglar · Cuentas por pagar")
-            st.caption(f"Asunto: {asunto}")
-            if st.button("Enviar", type="primary"):
-                if not para.strip():
-                    st.warning("Escriba al menos un destinatario.")
-                else:
-                    try:
-                        enviar_correo(asunto, texto_cxp(), html_cxp(),
-                                      [d.strip() for d in para.split(",") if d.strip()])
-                        st.success("Correo enviado.")
-                    except KeyError:
-                        st.error("Falta configurar el correo en los secretos. Ver el README.")
-                    except Exception as e:
-                        st.error(f"No se pudo enviar: {e}")
 
 # ─────────────────────── Cuentas por pagar ───────────────────────
 
@@ -1237,86 +1152,73 @@ if not iva_raw.empty:
 
 # ─────────────────────── Pendientes por asignar ───────────────────────
 
-SIN_PROYECTO = {"", "nan", "none", "revisar", "por asignar", "sin asignar"}
+SIN_CENTRO = {"", "nan", "none", "revisar", "por asignar", "sin asignar"}
 
 
-def sin_asignar_cxp(cxp):
-    """Facturas de compra que aún no tienen cliente o proyecto."""
-    if cxp.empty:
-        return pd.DataFrame()
-    cli = cxp["Cliente"].astype(str).str.strip().str.lower()
-    proy = cxp["Proyecto"].astype(str).str.strip().str.lower()
-    # Cliente NA significa gasto de la operación, no es un pendiente
-    falta = cli.isin(SIN_PROYECTO) | (~cli.eq("na") & proy.isin(SIN_PROYECTO | {"na"}))
-    return cxp[falta]
+def falta_centro(serie):
+    """True donde el centro de costo está vacío o sin definir."""
+    return serie.fillna("").astype(str).str.strip().str.lower().isin(SIN_CENTRO)
 
 
-def sin_asignar_mov(mov):
-    """Movimientos de ingreso o costo de venta sin cliente o proyecto."""
-    base = mov[mov["cuenta"].isin(["Ingresos", "Costo Ventas"])]
-    cli = base["cliente"].astype(str).str.strip().str.lower()
-    proy = base["proyecto"].astype(str).str.strip().str.lower()
-    falta = cli.isin(SIN_PROYECTO | {"na"}) | proy.isin(SIN_PROYECTO | {"na"})
-    return base[falta]
+def pendientes_centro():
+    """Lo que aún no tiene centro de costo en las tres pestañas."""
+    out = {}
 
-pend_cxp = sin_asignar_cxp(cxp)
-pend_mov = sin_asignar_mov(df)
-val_cxp = float(pend_cxp["Valor Producto"].sum()) if not pend_cxp.empty else 0.0
-val_mov = float(pend_mov["valor"].sum()) if not pend_mov.empty else 0.0
+    # Extracto: solo ingresos y costo de ventas necesitan centro
+    if "centro" in df.columns:
+        base = df[df["cuenta"].isin(["Ingresos", "Costo Ventas"])]
+        out["mov"] = base[falta_centro(base["centro"])]
+    else:
+        out["mov"] = pd.DataFrame()
 
-if not pend_cxp.empty or not pend_mov.empty:
+    col_cxp = "Centro de costo" if "Centro de costo" in cxp.columns else None
+    out["cxp"] = cxp[falta_centro(cxp[col_cxp])] if col_cxp else pd.DataFrame()
+
+    col_cxc = "Centro de costo" if "Centro de costo" in cxc.columns else None
+    out["cxc"] = cxc[falta_centro(cxc[col_cxc])] if col_cxc else pd.DataFrame()
+    return out
+
+
+pc = pendientes_centro()
+v_mov = float(pc["mov"]["valor"].sum()) if not pc["mov"].empty else 0.0
+v_cxp = float(pc["cxp"]["Valor Producto"].sum()) if not pc["cxp"].empty else 0.0
+v_cxc = float(pc["cxc"]["Base sin IVA"].sum()) if not pc["cxc"].empty else 0.0
+
+if not pc["mov"].empty or not pc["cxp"].empty or not pc["cxc"].empty:
     st.markdown('<div class="seccion">Pendientes por asignar</div>',
                 unsafe_allow_html=True)
-    st.caption(
-        "Facturas y movimientos que todavía no tienen cliente o proyecto. "
-        "Mientras estén así no aparecen en la rentabilidad por proyecto."
-    )
+    st.caption("Movimientos y facturas sin centro de costo. Mientras estén así "
+               "no aparecen en la rentabilidad por proyecto.")
 
-    kx = st.columns(3)
-    kx[0].markdown(tarjeta("Facturas por asignar", money(val_cxp, True),
-                           f"{len(pend_cxp)} documentos"), unsafe_allow_html=True)
-    kx[1].markdown(tarjeta("Movimientos por asignar", money(abs(val_mov), True),
-                           f"{len(pend_mov)} movimientos"), unsafe_allow_html=True)
-    kx[2].markdown(tarjeta("Total", money(val_cxp + abs(val_mov), True),
-                           "Sin atribuir a un proyecto"), unsafe_allow_html=True)
+    kx = st.columns(4)
+    kx[0].markdown(tarjeta("Extracto", money(abs(v_mov), True),
+                           f"{len(pc['mov'])} movimientos"), unsafe_allow_html=True)
+    kx[1].markdown(tarjeta("Facturas recibidas", money(v_cxp, True),
+                           f"{len(pc['cxp'])} documentos"), unsafe_allow_html=True)
+    kx[2].markdown(tarjeta("Facturas emitidas", money(v_cxc, True),
+                           f"{len(pc['cxc'])} facturas"), unsafe_allow_html=True)
+    kx[3].markdown(tarjeta("Total", money(abs(v_mov) + v_cxp + v_cxc, True),
+                           "Sin centro de costo"), unsafe_allow_html=True)
 
-    if not pend_cxp.empty:
-        cols = [c for c in ["Fecha Recepción", "Factura", "Numero", "Proveedor",
-                            "Concepto/Rubro", "Valor Producto", "Cliente", "Proyecto"]
-                if c in pend_cxp.columns]
-        vista = pend_cxp[cols].copy()
-        if "Fecha Recepción" in vista.columns:
-            vista["Fecha Recepción"] = pd.to_datetime(
-                vista["Fecha Recepción"], errors="coerce").dt.strftime("%d/%m/%Y")
-        st.markdown("**Facturas de compra**")
-        st.dataframe(vista.style.format({"Valor Producto": "${:,.0f}"}),
+    def tabla_pendiente(titulo, datos, columnas, formato):
+        if datos.empty:
+            return
+        cols = [c for c in columnas if c in datos.columns]
+        vista = datos[cols].copy()
+        for c in cols:
+            if "echa" in c or c == "fecha":
+                vista[c] = pd.to_datetime(vista[c], errors="coerce").dt.strftime("%d/%m/%Y")
+        st.markdown(f"**{titulo}**")
+        st.dataframe(vista.style.format(formato, na_rep="—"),
                      use_container_width=True, hide_index=True)
 
-    if not pend_mov.empty:
-        cols = [c for c in ["fecha", "descripcion", "valor", "cuenta",
-                            "cliente", "proyecto"] if c in pend_mov.columns]
-        vista = pend_mov[cols].copy()
-        vista.columns = [c.capitalize() for c in vista.columns]
-        if "Fecha" in vista.columns:
-            vista["Fecha"] = pd.to_datetime(vista["Fecha"],
-                                            errors="coerce").dt.strftime("%d/%m/%Y")
-        st.markdown("**Movimientos del extracto**")
-        st.dataframe(vista.style.format({"Valor": "${:,.0f}"}),
-                     use_container_width=True, hide_index=True)
+    tabla_pendiente("Movimientos del extracto", pc["mov"],
+                    ["fecha", "descripcion", "valor", "cuenta", "factura"],
+                    {"valor": "${:,.0f}"})
+    tabla_pendiente("Facturas recibidas (CxP)", pc["cxp"],
+                    ["Fecha Recepción", "Factura", "Proveedor", "Concepto/Rubro",
+                     "Valor Producto"], {"Valor Producto": "${:,.0f}"})
+    tabla_pendiente("Facturas emitidas (CxC)", pc["cxc"],
+                    ["Folio", "Fecha", "Cliente", "Concepto", "Base sin IVA"],
+                    {"Base sin IVA": "${:,.0f}"})
 
-# ─────────────────────── Composición del gasto ───────────────────────
-
-st.markdown('<div class="seccion">Composición del gasto</div>', unsafe_allow_html=True)
-gasto = (f_pyg[f_pyg["valor_neto"] < 0].groupby("cuenta")["valor_neto"]
-         .sum().abs().sort_values())
-if not gasto.empty:
-    st.plotly_chart(barras_horizontal(gasto.index, gasto.values, GRIS,
-                                      "Salidas por cuenta", 280),
-                    use_container_width=True, config=PLOTLY_CONF)
-
-sin_clasificar = df.loc[df["cuenta"].eq("Revisar"), "valor"].sum()
-if abs(sin_clasificar) > 0:
-    st.warning(
-        f"Hay movimientos sin clasificar por {money(sin_clasificar)}. "
-        "No entran al resultado hasta asignarles categoría."
-    )
